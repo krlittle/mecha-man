@@ -1,6 +1,8 @@
 # Build artifacts
 *.o
-*.nes
+
+# Root-level NES ROM (build output)
+/hello.nes
 
 # Session logs (local reference only)
 sessions/

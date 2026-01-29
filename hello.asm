@@ -37,6 +37,17 @@ PPUSTATUS = $2002   ; PPU Status Register (read-only)
                      ;   Reading this register resets the address latch used
                      ;   by PPUADDR.
 
+OAMADDR   = $2003   ; OAM Address Register
+                     ;   Sets the starting address in OAM for OAMDATA writes
+                     ;   or OAM DMA transfers.
+
+OAMDATA   = $2004   ; OAM Data Register
+                     ;   Write sprite data one byte at a time (rarely used
+                     ;   directly; DMA via $4014 is preferred).
+
+PPUSCROLL = $2005   ; PPU Scroll Register (write twice: X scroll, then Y)
+                     ;   Sets the fine scroll position for the background.
+
 PPUADDR   = $2006   ; PPU Address Register (write twice: high byte, then low)
                      ;   Sets the target address in PPU memory for the next
                      ;   read/write through PPUDATA.
@@ -45,6 +56,18 @@ PPUDATA   = $2007   ; PPU Data Register
                      ;   Reads/writes one byte to PPU memory at the address
                      ;   set by PPUADDR. The address auto-increments after
                      ;   each access (by 1 or 32, controlled by PPUCTRL bit 2).
+
+OAMDMA    = $4014   ; OAM DMA Register
+                     ;   Writing a page number here (e.g., $02) triggers a
+                     ;   256-byte transfer from CPU $0200-$02FF to PPU OAM.
+                     ;   This is the fast way to update all sprites each frame.
+
+JOYPAD1   = $4016   ; Controller 1 Port
+                     ;   Write 1 then 0 to strobe (latch button states).
+                     ;   Then read 8 times to get each button in bit 0:
+                     ;   A, B, Select, Start, Up, Down, Left, Right.
+
+JOYPAD2   = $4017   ; Controller 2 Port
 
 ; ---------------------------------------------------------------------------
 ; iNES Header
@@ -79,7 +102,17 @@ PPUDATA   = $2007   ; PPU Data Register
 
 .segment "ZEROPAGE"
 
-; (No variables needed for this simple program)
+sprite_x:   .res 1   ; Sprite X position (0-255)
+sprite_y:   .res 1   ; Sprite Y position (0-239)
+controller: .res 1   ; Current controller button state
+                      ;   Bit 7: A
+                      ;   Bit 6: B
+                      ;   Bit 5: Select
+                      ;   Bit 4: Start
+                      ;   Bit 3: Up
+                      ;   Bit 2: Down
+                      ;   Bit 1: Left
+                      ;   Bit 0: Right
 
 ; ---------------------------------------------------------------------------
 ; Main Code
@@ -217,32 +250,76 @@ LoadMessage:
     jmp LoadMessage      ; JuMP back to load next character
 DoneMessage:
 
+    ; --- Initialize sprite ---
+    ; Place our sprite in the center of the screen.
+    ; NES visible area is 256x240 pixels, so center is ~(128, 120).
+    ; We subtract 1 from Y because OAM Y values are displayed one scanline
+    ; lower than stored (Y=0 means scanline 1).
+
+    lda #119
+    sta sprite_y
+    lda #128
+    sta sprite_x
+
+    ; Set up the OAM buffer at $0200 for our sprite.
+    ; Each sprite is 4 bytes in OAM:
+    ;   Byte 0: Y position (top of sprite, minus 1)
+    ;   Byte 1: Tile index (from pattern table)
+    ;   Byte 2: Attributes
+    ;           Bits 0-1: Palette (0-3, selects from sprite palettes)
+    ;           Bit 5: Priority (0 = in front of background)
+    ;           Bit 6: Flip horizontal
+    ;           Bit 7: Flip vertical
+    ;   Byte 3: X position (left edge of sprite)
+
+    lda sprite_y
+    sta $0200       ; Y position
+    lda #$22        ; Tile index $22 (our sprite tile in CHR-ROM)
+    sta $0201
+    lda #$00        ; Attributes: palette 0, no flip, in front of BG
+    sta $0202
+    lda sprite_x
+    sta $0203       ; X position
+
+    ; Hide all other sprites by moving them off-screen (Y = $FE).
+    ; The NES has 64 sprites (4 bytes each = 256 bytes).
+    ; We only use sprite 0, so hide sprites 1-63.
+    lda #$FE
+    ldx #$04        ; Start at byte 4 (sprite 1's Y position)
+HideSprites:
+    sta $0200, x    ; Set Y to $FE (off-screen)
+    inx
+    inx
+    inx
+    inx             ; Advance to next sprite's Y byte (every 4 bytes)
+    bne HideSprites ; Loop until X wraps to 0 (256 bytes done)
+
     ; --- Enable rendering ---
     ; Now we turn on the PPU and let it start drawing.
 
     ; First, reset the scroll position to (0,0).
-    ; If we don't do this, the screen may appear shifted.
     bit PPUSTATUS   ; Reset latch
     lda #$00
-    sta $2005       ; PPUSCROLL X = 0
-    sta $2005       ; PPUSCROLL Y = 0
+    sta PPUSCROLL   ; X scroll = 0
+    sta PPUSCROLL   ; Y scroll = 0
 
     ; Enable NMI and set background pattern table to $0000.
     lda #%10000000  ; Bit 7 = 1: Enable NMI on VBlank
                     ; Bit 4 = 0: Background uses pattern table 0 ($0000)
     sta PPUCTRL
 
-    ; Turn on background rendering.
-    lda #%00001010  ; Bit 3 = 1: Show background
+    ; Turn on background AND sprite rendering.
+    lda #%00011110  ; Bit 4 = 1: Show sprites
+                    ; Bit 3 = 1: Show background
+                    ; Bit 2 = 1: Show sprites in leftmost 8 pixels
                     ; Bit 1 = 1: Show background in leftmost 8 pixels
     sta PPUMASK
 
     ; --- Main loop: do nothing forever ---
-    ; Our Hello World is static. The NMI handler runs every frame
-    ; (60 times per second on NTSC) and could be used for animation,
-    ; input, etc. For now, we just loop.
+    ; The NMI handler now does all the work each frame:
+    ; DMA sprites, read controller, move sprite.
 Forever:
-    jmp Forever     ; Infinite loop. The NMI interrupt will still fire.
+    jmp Forever     ; Infinite loop. The NMI interrupt fires every VBlank.
 
 
 ; ===== NMI: Called every VBlank (once per frame, ~60 Hz) =====
@@ -251,7 +328,112 @@ Forever:
 ; scroll, read controllers, etc.
 
 NMI:
-    rti             ; ReTurn from Interrupt. Nothing to do yet.
+    ; Save registers (the main loop or interrupted code may be using them)
+    pha             ; Push A to stack
+    txa
+    pha             ; Push X to stack
+    tya
+    pha             ; Push Y to stack
+
+    ; --- Step 1: OAM DMA ---
+    ; Transfer our sprite buffer ($0200-$02FF) to the PPU's OAM.
+    ; This MUST happen during VBlank or you get visual glitches.
+    lda #$00
+    sta OAMADDR     ; Start writing at OAM address 0
+    lda #$02
+    sta OAMDMA      ; Initiate DMA from CPU page $02 ($0200-$02FF)
+                    ; This takes 513-514 CPU cycles but it's worth it.
+
+    ; --- Step 2: Read Controller 1 ---
+    ; The controller is read by "strobing" it (write 1, then 0 to $4016),
+    ; which latches the current button states. Then we read $4016 eight
+    ; times. Each read returns one button in bit 0, in this order:
+    ;   A, B, Select, Start, Up, Down, Left, Right
+    ;
+    ; We shift each bit into the 'controller' variable using ROL.
+
+    lda #$01
+    sta JOYPAD1     ; Strobe: latch button states
+    lda #$00
+    sta JOYPAD1     ; Strobe off: now we can read
+
+    ldx #$08        ; Read 8 buttons
+ReadController:
+    lda JOYPAD1     ; Read next button (bit 0 = pressed)
+    lsr a           ; Shift bit 0 into Carry flag
+    rol controller  ; Rotate Carry into controller (builds up all 8 bits)
+    dex
+    bne ReadController
+    ; controller now holds: A B Sel Start Up Down Left Right
+    ;                       7 6  5    4   3   2    1    0
+
+    ; --- Step 3: Move sprite based on D-pad ---
+    ; Check each direction and adjust position.
+    ; Movement speed: 2 pixels per frame.
+
+    ; Check UP (bit 3)
+    lda controller
+    and #%00001000
+    beq CheckDown
+    lda sprite_y
+    cmp #$02        ; Don't go above top of screen
+    bcc CheckDown
+    dec sprite_y
+    dec sprite_y
+CheckDown:
+    lda controller
+    and #%00000100
+    beq CheckLeft
+    lda sprite_y
+    cmp #$DE        ; Don't go below bottom (222, accounting for sprite height)
+    bcs CheckLeft
+    inc sprite_y
+    inc sprite_y
+CheckLeft:
+    lda controller
+    and #%00000010
+    beq CheckRight
+    lda sprite_x
+    cmp #$02        ; Don't go past left edge
+    bcc CheckRight
+    dec sprite_x
+    dec sprite_x
+CheckRight:
+    lda controller
+    and #%00000001
+    beq DoneInput
+    lda sprite_x
+    cmp #$F8        ; Don't go past right edge (248)
+    bcs DoneInput
+    inc sprite_x
+    inc sprite_x
+DoneInput:
+
+    ; --- Step 4: Update OAM buffer with new position ---
+    lda sprite_y
+    sta $0200       ; Update sprite Y in OAM buffer
+    lda sprite_x
+    sta $0203       ; Update sprite X in OAM buffer
+
+    ; --- Step 5: Reset scroll ---
+    ; OAM DMA and other PPU writes can corrupt the scroll position.
+    ; We must restore it every frame.
+    bit PPUSTATUS
+    lda #$00
+    sta PPUSCROLL   ; X scroll = 0
+    sta PPUSCROLL   ; Y scroll = 0
+
+    lda #%10000000
+    sta PPUCTRL     ; Re-enable NMI, background pattern table 0
+
+    ; Restore registers
+    pla
+    tay             ; Restore Y
+    pla
+    tax             ; Restore X
+    pla             ; Restore A
+
+    rti             ; ReTurn from Interrupt
 
 
 ; ===== IRQ: Hardware interrupt handler =====
@@ -288,8 +470,13 @@ PaletteData:
     .byte $0F,$30,$16,$1A
     .byte $0F,$30,$16,$1A
 
-    ; Sprite palettes 0-3 (unused in this demo)
-    .byte $0F,$30,$16,$1A
+    ; Sprite palette 0 (used for our player sprite)
+    .byte $0F       ; Color 0: transparent (uses universal BG color)
+    .byte $21       ; Color 1: light blue (sprite outline/fill)
+    .byte $30       ; Color 2: white (highlight)
+    .byte $16       ; Color 3: red (accent)
+
+    ; Sprite palettes 1-3 (unused, filled for completeness)
     .byte $0F,$30,$16,$1A
     .byte $0F,$30,$16,$1A
     .byte $0F,$30,$16,$1A
@@ -662,3 +849,26 @@ MessageData:
 .byte %00011000
 .byte %00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
+
+; --- Tile $22: Player sprite (small diamond/arrow character) ---
+; A simple 8x8 character: diamond shape with eyes.
+; Uses color 1 (light blue) for the body and color 2 (white) for eyes.
+;
+; Plane 0 (low bit):
+.byte %00011000  ; Row 0:    **
+.byte %00111100  ; Row 1:   ****
+.byte %01111110  ; Row 2:  ******
+.byte %01100110  ; Row 3:  **  **    (eyes are color 2, body color 1)
+.byte %01111110  ; Row 4:  ******
+.byte %01111110  ; Row 5:  ******
+.byte %00111100  ; Row 6:   ****
+.byte %00011000  ; Row 7:    **
+; Plane 1 (high bit):
+.byte %00000000  ; Row 0
+.byte %00000000  ; Row 1
+.byte %00000000  ; Row 2
+.byte %00011000  ; Row 3:    **      (eyes: plane1=1, plane0=0 → color 2)
+.byte %00000000  ; Row 4
+.byte %00000000  ; Row 5
+.byte %00000000  ; Row 6
+.byte %00000000  ; Row 7
