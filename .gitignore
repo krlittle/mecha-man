@@ -1,0 +1,6 @@
+# Build artifacts
+*.o
+*.nes
+
+# Session logs (local reference only)
+sessions/
