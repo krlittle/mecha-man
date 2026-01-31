@@ -17,6 +17,7 @@ LINK = ld65
 # Source files
 SRC = hello.asm
 CFG = nes.cfg
+CHR = assets/chr/megaman_sprites.chr
 
 # Output files
 OBJ = hello.o
@@ -26,8 +27,8 @@ ROM = hello.nes
 $(ROM): $(OBJ)
 	$(LINK) -o $(ROM) -C $(CFG) $(OBJ)
 
-# Assemble the source
-$(OBJ): $(SRC)
+# Assemble the source (depends on CHR binary included via .incbin)
+$(OBJ): $(SRC) $(CHR)
 	$(ASM) -o $(OBJ) $(SRC)
 
 # Clean up build artifacts

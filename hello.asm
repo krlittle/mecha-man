@@ -1,25 +1,22 @@
 ; ============================================================================
-; Hello World - NES ROM
+; Mecha Man - NES ROM
 ; ============================================================================
 ;
-; This program displays "HELLO WORLD!" on the NES screen.
+; Displays "HELLO WORLD!" on the background and a Mega Man character that
+; can run left and right using the D-pad. Features:
+;   - Multi-tile metasprites (2x3 = 16x24 pixel character)
+;   - Standing and running animation
+;   - Horizontal flip for left/right facing
 ;
-; Key Concepts:
-;   - The NES PPU (Picture Processing Unit) draws the screen.
-;   - We can't draw pixels directly. Instead, we place TILE INDICES into a
-;     32x30 grid called the "nametable." Each cell references an 8x8 pixel
-;     tile from the CHR-ROM (pattern table).
-;   - To display text, we need a font stored as tiles in CHR-ROM, and we
-;     write the correct tile indices into the nametable.
-;   - All PPU communication happens through memory-mapped registers at
-;     $2000-$2007 on the CPU bus.
+; CHR-ROM layout:
+;   Pattern Table 0 ($0000-$0FFF): Background tiles (font A-Z, etc.)
+;   Pattern Table 1 ($1000-$1FFF): Sprite tiles (Mega Man poses)
+;
 ; ============================================================================
 
 ; ---------------------------------------------------------------------------
 ; PPU Register Definitions
 ; ---------------------------------------------------------------------------
-; These are the memory-mapped addresses the CPU uses to talk to the PPU.
-; Giving them names makes our code much more readable.
 
 PPUCTRL   = $2000   ; PPU Control Register 1
                      ;   Bit 7: Generate NMI on VBlank (1 = enable)
@@ -34,85 +31,74 @@ PPUMASK   = $2001   ; PPU Control Register 2
 
 PPUSTATUS = $2002   ; PPU Status Register (read-only)
                      ;   Bit 7: VBlank has started (1 = yes)
-                     ;   Reading this register resets the address latch used
-                     ;   by PPUADDR.
+                     ;   Reading this register resets the address latch.
 
 OAMADDR   = $2003   ; OAM Address Register
-                     ;   Sets the starting address in OAM for OAMDATA writes
-                     ;   or OAM DMA transfers.
-
 OAMDATA   = $2004   ; OAM Data Register
-                     ;   Write sprite data one byte at a time (rarely used
-                     ;   directly; DMA via $4014 is preferred).
-
-PPUSCROLL = $2005   ; PPU Scroll Register (write twice: X scroll, then Y)
-                     ;   Sets the fine scroll position for the background.
-
-PPUADDR   = $2006   ; PPU Address Register (write twice: high byte, then low)
-                     ;   Sets the target address in PPU memory for the next
-                     ;   read/write through PPUDATA.
-
+PPUSCROLL = $2005   ; PPU Scroll Register (write twice: X, then Y)
+PPUADDR   = $2006   ; PPU Address Register (write twice: high, then low)
 PPUDATA   = $2007   ; PPU Data Register
-                     ;   Reads/writes one byte to PPU memory at the address
-                     ;   set by PPUADDR. The address auto-increments after
-                     ;   each access (by 1 or 32, controlled by PPUCTRL bit 2).
-
 OAMDMA    = $4014   ; OAM DMA Register
-                     ;   Writing a page number here (e.g., $02) triggers a
-                     ;   256-byte transfer from CPU $0200-$02FF to PPU OAM.
-                     ;   This is the fast way to update all sprites each frame.
 
 JOYPAD1   = $4016   ; Controller 1 Port
-                     ;   Write 1 then 0 to strobe (latch button states).
-                     ;   Then read 8 times to get each button in bit 0:
-                     ;   A, B, Select, Start, Up, Down, Left, Right.
-
 JOYPAD2   = $4017   ; Controller 2 Port
+
+; ---------------------------------------------------------------------------
+; Constants
+; ---------------------------------------------------------------------------
+
+; PPUCTRL value: NMI enabled, BG uses pattern table 0, sprites use table 1
+PPUCTRL_VAL = %10001000
+
+; Animation timing (frames between animation ticks)
+ANIM_SPEED_RUN  = 6     ; ~10 fps run cycle at 60 Hz
+MOVE_SPEED      = 2     ; Pixels per frame
+
+; Sprite attribute bits
+FLIP_H          = %01000000  ; Horizontal flip
+
+; Screen bounds (accounting for 16x24 metasprite)
+BOUND_LEFT      = $02
+BOUND_RIGHT     = $EE        ; 238 = 256 - 16 - 2
 
 ; ---------------------------------------------------------------------------
 ; iNES Header
 ; ---------------------------------------------------------------------------
-; Every NES ROM begins with a 16-byte header that tells the emulator (or
-; hardware) about the cartridge configuration.
 
 .segment "HEADER"
 
-    .byte "NES",$1A   ; Magic number: "NES" followed by MS-DOS end-of-file
-                       ; This identifies the file as an iNES ROM.
-
-    .byte $01          ; Number of 16KB PRG-ROM banks (1 = 16KB of code space)
-    .byte $01          ; Number of 8KB CHR-ROM banks (1 = 8KB of graphics)
-
+    .byte "NES",$1A   ; Magic number
+    .byte $01          ; 1 x 16KB PRG-ROM bank
+    .byte $01          ; 1 x 8KB CHR-ROM bank
     .byte $00          ; Flags 6: Mapper 0 (NROM), horizontal mirroring
-                       ;   Bit 0: Mirroring (0=horizontal, 1=vertical)
-                       ;   Bits 4-7: Lower nibble of mapper number
-
-    .byte $00          ; Flags 7: Mapper 0 (upper nibble), NES 1.0 format
-    .byte $00          ; PRG-RAM size (0 = 8KB, not used here)
-    .byte $00          ; Flags 9: NTSC
-    .byte $00          ; Flags 10: unused
-    .byte $00,$00,$00,$00,$00  ; Padding to reach 16 bytes
+    .byte $00          ; Flags 7: Mapper 0, NES 1.0
+    .byte $00,$00,$00  ; Flags 8-10
+    .byte $00,$00,$00,$00,$00  ; Padding
 
 ; ---------------------------------------------------------------------------
 ; Zero Page Variables
 ; ---------------------------------------------------------------------------
-; The 6502's zero page ($0000-$00FF) is special: instructions that access
-; it are 1 byte shorter and 1 cycle faster. Use it for your most
-; frequently accessed variables.
+; The 6502 zero page ($0000-$00FF) provides fast access (1 byte shorter,
+; 1 cycle faster). We use it for all frequently-accessed game state.
 
 .segment "ZEROPAGE"
 
-sprite_x:   .res 1   ; Sprite X position (0-255)
-sprite_y:   .res 1   ; Sprite Y position (0-239)
+sprite_x:   .res 1   ; Metasprite anchor X position
+sprite_y:   .res 1   ; Metasprite anchor Y position
 controller: .res 1   ; Current controller button state
-                      ;   Bit 7: A
-                      ;   Bit 6: B
-                      ;   Bit 5: Select
-                      ;   Bit 4: Start
-                      ;   Bit 3: Up
-                      ;   Bit 2: Down
-                      ;   Bit 1: Left
-                      ;   Bit 0: Right
+                      ;   Bit 7: A     Bit 3: Up
+                      ;   Bit 6: B     Bit 2: Down
+                      ;   Bit 5: Sel   Bit 1: Left
+                      ;   Bit 4: Start Bit 0: Right
+
+; Animation state
+facing_dir: .res 1   ; 0 = facing right, 1 = facing left
+anim_state: .res 1   ; 0 = idle/standing, 1 = running
+anim_frame: .res 1   ; Current frame index within animation
+anim_timer: .res 1   ; Frame counter until next animation tick
+
+; Metasprite rendering
+meta_ptr:   .res 2   ; 16-bit pointer to current metasprite data (lo, hi)
 
 ; ---------------------------------------------------------------------------
 ; Main Code
@@ -120,327 +106,392 @@ controller: .res 1   ; Current controller button state
 
 .segment "CODE"
 
-; ===== RESET: Entry point when the NES is powered on or reset =====
-;
-; When the NES powers on, the CPU reads the address stored at $FFFC-$FFFD
-; (the "reset vector") and jumps there. That's our Reset label.
-;
-; The first thing we MUST do is a careful initialization sequence.
-; The PPU takes about 30,000 CPU cycles to warm up, and accessing it
-; before it's ready causes glitches. The standard approach:
-;   1. Disable interrupts and decimal mode
-;   2. Set up the stack pointer
-;   3. Disable PPU rendering and NMIs
-;   4. Wait for two VBlank periods (the PPU's warm-up time)
+; ===== RESET: Entry point on power-on/reset =====
 
 Reset:
-    sei             ; SEt Interrupt disable flag.
-                    ; Prevents IRQ interrupts from firing during init.
-                    ; We don't want anything interrupting our setup.
+    sei
+    cld
+    ldx #$FF
+    txs
 
-    cld             ; CLear Decimal mode flag.
-                    ; The NES's 6502 doesn't have decimal mode, but it's
-                    ; good practice to explicitly disable it.
+    ; Disable PPU during init
+    lda #$00
+    sta PPUCTRL
+    sta PPUMASK
 
-    ldx #$FF        ; LoaD X register with $FF (255).
-    txs             ; Transfer X to Stack pointer.
-                    ; The stack lives at $0100-$01FF and grows downward.
-                    ; Setting S=$FF means the stack starts at $01FF.
-
-    ; --- Disable PPU features during initialization ---
-    lda #$00        ; LoaD Accumulator with 0.
-    sta PPUCTRL     ; Disable NMI (bit 7 = 0). We'll enable it later.
-    sta PPUMASK     ; Disable rendering (all bits 0). Screen is off.
-
-    ; --- Wait for first VBlank ---
-    ; VBlank is the period when the PPU is not drawing (between frames).
-    ; Bit 7 of PPUSTATUS is set when VBlank begins.
+    ; Wait for first VBlank
 WaitVBlank1:
-    bit PPUSTATUS   ; BIT test - copies bit 7 of PPUSTATUS into the
-                    ;   Negative flag (N). This is a neat trick:
-                    ;   we don't need to load the value, just test bit 7.
-    bpl WaitVBlank1 ; Branch if Plus (N=0). Keep looping until N=1,
-                    ;   meaning VBlank has started.
+    bit PPUSTATUS
+    bpl WaitVBlank1
 
-    ; --- Clear all RAM while we wait for the second VBlank ---
-    ; The NES RAM ($0000-$07FF) contains random garbage at power-on.
-    ; We zero it all out for a clean state.
-    lda #$00        ; Value to fill: zero
-    ldx #$00        ; Loop counter, starts at 0
+    ; Clear all RAM
+    lda #$00
+    ldx #$00
 ClearRAM:
-    sta $0000, x    ; Store zero at address $0000 + X
-    sta $0100, x    ; Store zero at $0100 + X (stack page)
-    sta $0200, x    ; Store zero at $0200 + X
-    sta $0300, x    ; Store zero at $0300 + X
-    sta $0400, x    ; Store zero at $0400 + X
-    sta $0500, x    ; Store zero at $0500 + X
-    sta $0600, x    ; Store zero at $0600 + X
-    sta $0700, x    ; Store zero at $0700 + X
-    inx             ; INcrement X. When X wraps from $FF to $00...
-    bne ClearRAM    ; ...the Zero flag is set, so BNE (Branch if Not Equal
-                    ;   to zero) will stop looping. This clears all 2KB.
+    sta $0000, x
+    sta $0100, x
+    sta $0200, x
+    sta $0300, x
+    sta $0400, x
+    sta $0500, x
+    sta $0600, x
+    sta $0700, x
+    inx
+    bne ClearRAM
 
-    ; --- Wait for second VBlank ---
-    ; After two VBlanks, the PPU is guaranteed to be warmed up and ready.
+    ; Wait for second VBlank
 WaitVBlank2:
     bit PPUSTATUS
     bpl WaitVBlank2
 
     ; ==================================================================
-    ; PPU is now ready! Let's set up our graphics.
+    ; PPU is ready. Set up graphics.
     ; ==================================================================
 
-    ; --- Load the color palette ---
-    ; The NES has 32 bytes of palette RAM (at PPU address $3F00-$3F1F).
-    ;   $3F00-$3F0F: Background palettes (4 palettes x 4 colors)
-    ;   $3F10-$3F1F: Sprite palettes (4 palettes x 4 colors)
-    ;
-    ; To write to PPU memory, we:
-    ;   1. Read PPUSTATUS (resets the address latch)
-    ;   2. Write the HIGH byte of the target address to PPUADDR
-    ;   3. Write the LOW byte to PPUADDR
-    ;   4. Write data bytes to PPUDATA (address auto-increments)
-
-    bit PPUSTATUS   ; Reset the address latch (important!)
+    ; --- Load color palette ---
+    bit PPUSTATUS
     lda #$3F
-    sta PPUADDR     ; High byte of $3F00
+    sta PPUADDR
     lda #$00
-    sta PPUADDR     ; Low byte of $3F00. PPU address is now $3F00.
+    sta PPUADDR
 
-    ; Write our palette data. We'll use a loop.
     ldx #$00
 LoadPalette:
-    lda PaletteData, x  ; Load byte from our palette table (defined below)
-    sta PPUDATA          ; Write it to PPU palette RAM
+    lda PaletteData, x
+    sta PPUDATA
     inx
-    cpx #$20             ; ComPare X to 32 ($20). Have we written all 32 bytes?
-    bne LoadPalette      ; If not, keep going.
+    cpx #$20
+    bne LoadPalette
 
-    ; --- Write "HELLO WORLD!" to the nametable ---
-    ; The nametable is a 32x30 grid of tile indices starting at PPU $2000.
-    ; Each row is 32 bytes. To calculate the address for row R, column C:
-    ;   address = $2000 + (R * 32) + C
-    ;
-    ; Let's place our text roughly in the center of the screen:
-    ;   Row 14, Column 10
-    ;   Address = $2000 + (14 * 32) + 10 = $2000 + 448 + 10 = $21CA
-
-    bit PPUSTATUS   ; Reset address latch
+    ; --- Write "HELLO WORLD!" to nametable ---
+    ; Row 14, Column 10 = PPU address $21CA
+    bit PPUSTATUS
     lda #$21
-    sta PPUADDR     ; High byte of $21CA
+    sta PPUADDR
     lda #$CA
-    sta PPUADDR     ; Low byte. PPU address is now $21CA.
-
-    ; Write the tile indices for each letter.
-    ; In our CHR-ROM (defined at the bottom), we've arranged the tiles so
-    ; that ASCII-like indices map to letters. Tile $00 is blank,
-    ; and letters start where we define them.
-    ; Our font starts at tile $00, with:
-    ;   'H' = $08, 'E' = $05, 'L' = $0C, 'O' = $0F
-    ;   'W' = $17, 'R' = $12, 'D' = $04, '!' = $21
-    ;   ' ' = $00 (blank tile)
+    sta PPUADDR
 
     ldx #$00
 LoadMessage:
-    lda MessageData, x  ; Load next character tile index
-    cmp #$FF             ; Is it our end-of-string marker?
-    beq DoneMessage      ; If yes, we're done.
-    sta PPUDATA          ; Write tile index to nametable
+    lda MessageData, x
+    cmp #$FF
+    beq DoneMessage
+    sta PPUDATA
     inx
-    jmp LoadMessage      ; JuMP back to load next character
+    jmp LoadMessage
 DoneMessage:
 
-    ; --- Initialize sprite ---
-    ; Place our sprite in the center of the screen.
-    ; NES visible area is 256x240 pixels, so center is ~(128, 120).
-    ; We subtract 1 from Y because OAM Y values are displayed one scanline
-    ; lower than stored (Y=0 means scanline 1).
-
-    lda #119
+    ; --- Initialize player state ---
+    lda #200             ; Start near bottom of screen
     sta sprite_y
-    lda #128
+    lda #120             ; Roughly centered horizontally
     sta sprite_x
+    lda #$00
+    sta facing_dir       ; Face right
+    sta anim_state       ; Idle
+    sta anim_frame       ; Frame 0
+    sta anim_timer       ; Timer at 0
 
-    ; Set up the OAM buffer at $0200 for our sprite.
-    ; Each sprite is 4 bytes in OAM:
-    ;   Byte 0: Y position (top of sprite, minus 1)
-    ;   Byte 1: Tile index (from pattern table)
-    ;   Byte 2: Attributes
-    ;           Bits 0-1: Palette (0-3, selects from sprite palettes)
-    ;           Bit 5: Priority (0 = in front of background)
-    ;           Bit 6: Flip horizontal
-    ;           Bit 7: Flip vertical
-    ;   Byte 3: X position (left edge of sprite)
-
-    lda sprite_y
-    sta $0200       ; Y position
-    lda #$22        ; Tile index $22 (our sprite tile in CHR-ROM)
-    sta $0201
-    lda #$00        ; Attributes: palette 0, no flip, in front of BG
-    sta $0202
-    lda sprite_x
-    sta $0203       ; X position
-
-    ; Hide all other sprites by moving them off-screen (Y = $FE).
-    ; The NES has 64 sprites (4 bytes each = 256 bytes).
-    ; We only use sprite 0, so hide sprites 1-63.
-    lda #$FE
-    ldx #$04        ; Start at byte 4 (sprite 1's Y position)
-HideSprites:
-    sta $0200, x    ; Set Y to $FE (off-screen)
-    inx
-    inx
-    inx
-    inx             ; Advance to next sprite's Y byte (every 4 bytes)
-    bne HideSprites ; Loop until X wraps to 0 (256 bytes done)
+    ; --- Draw initial metasprite to OAM buffer ---
+    lda #<MetaStand
+    sta meta_ptr
+    lda #>MetaStand
+    sta meta_ptr+1
+    jsr DrawMetasprite
 
     ; --- Enable rendering ---
-    ; Now we turn on the PPU and let it start drawing.
-
-    ; First, reset the scroll position to (0,0).
-    bit PPUSTATUS   ; Reset latch
-    lda #$00
-    sta PPUSCROLL   ; X scroll = 0
-    sta PPUSCROLL   ; Y scroll = 0
-
-    ; Enable NMI and set background pattern table to $0000.
-    lda #%10000000  ; Bit 7 = 1: Enable NMI on VBlank
-                    ; Bit 4 = 0: Background uses pattern table 0 ($0000)
-    sta PPUCTRL
-
-    ; Turn on background AND sprite rendering.
-    lda #%00011110  ; Bit 4 = 1: Show sprites
-                    ; Bit 3 = 1: Show background
-                    ; Bit 2 = 1: Show sprites in leftmost 8 pixels
-                    ; Bit 1 = 1: Show background in leftmost 8 pixels
-    sta PPUMASK
-
-    ; --- Main loop: do nothing forever ---
-    ; The NMI handler now does all the work each frame:
-    ; DMA sprites, read controller, move sprite.
-Forever:
-    jmp Forever     ; Infinite loop. The NMI interrupt fires every VBlank.
-
-
-; ===== NMI: Called every VBlank (once per frame, ~60 Hz) =====
-; The PPU triggers a Non-Maskable Interrupt at the start of each VBlank
-; period. This is the heartbeat of your game — where you'd update sprites,
-; scroll, read controllers, etc.
-
-NMI:
-    ; Save registers (the main loop or interrupted code may be using them)
-    pha             ; Push A to stack
-    txa
-    pha             ; Push X to stack
-    tya
-    pha             ; Push Y to stack
-
-    ; --- Step 1: OAM DMA ---
-    ; Transfer our sprite buffer ($0200-$02FF) to the PPU's OAM.
-    ; This MUST happen during VBlank or you get visual glitches.
-    lda #$00
-    sta OAMADDR     ; Start writing at OAM address 0
-    lda #$02
-    sta OAMDMA      ; Initiate DMA from CPU page $02 ($0200-$02FF)
-                    ; This takes 513-514 CPU cycles but it's worth it.
-
-    ; --- Step 2: Read Controller 1 ---
-    ; The controller is read by "strobing" it (write 1, then 0 to $4016),
-    ; which latches the current button states. Then we read $4016 eight
-    ; times. Each read returns one button in bit 0, in this order:
-    ;   A, B, Select, Start, Up, Down, Left, Right
-    ;
-    ; We shift each bit into the 'controller' variable using ROL.
-
-    lda #$01
-    sta JOYPAD1     ; Strobe: latch button states
-    lda #$00
-    sta JOYPAD1     ; Strobe off: now we can read
-
-    ldx #$08        ; Read 8 buttons
-ReadController:
-    lda JOYPAD1     ; Read next button (bit 0 = pressed)
-    lsr a           ; Shift bit 0 into Carry flag
-    rol controller  ; Rotate Carry into controller (builds up all 8 bits)
-    dex
-    bne ReadController
-    ; controller now holds: A B Sel Start Up Down Left Right
-    ;                       7 6  5    4   3   2    1    0
-
-    ; --- Step 3: Move sprite based on D-pad ---
-    ; Check each direction and adjust position.
-    ; Movement speed: 2 pixels per frame.
-
-    ; Check UP (bit 3)
-    lda controller
-    and #%00001000
-    beq CheckDown
-    lda sprite_y
-    cmp #$02        ; Don't go above top of screen
-    bcc CheckDown
-    dec sprite_y
-    dec sprite_y
-CheckDown:
-    lda controller
-    and #%00000100
-    beq CheckLeft
-    lda sprite_y
-    cmp #$DE        ; Don't go below bottom (222, accounting for sprite height)
-    bcs CheckLeft
-    inc sprite_y
-    inc sprite_y
-CheckLeft:
-    lda controller
-    and #%00000010
-    beq CheckRight
-    lda sprite_x
-    cmp #$02        ; Don't go past left edge
-    bcc CheckRight
-    dec sprite_x
-    dec sprite_x
-CheckRight:
-    lda controller
-    and #%00000001
-    beq DoneInput
-    lda sprite_x
-    cmp #$F8        ; Don't go past right edge (248)
-    bcs DoneInput
-    inc sprite_x
-    inc sprite_x
-DoneInput:
-
-    ; --- Step 4: Update OAM buffer with new position ---
-    lda sprite_y
-    sta $0200       ; Update sprite Y in OAM buffer
-    lda sprite_x
-    sta $0203       ; Update sprite X in OAM buffer
-
-    ; --- Step 5: Reset scroll ---
-    ; OAM DMA and other PPU writes can corrupt the scroll position.
-    ; We must restore it every frame.
     bit PPUSTATUS
     lda #$00
-    sta PPUSCROLL   ; X scroll = 0
-    sta PPUSCROLL   ; Y scroll = 0
+    sta PPUSCROLL
+    sta PPUSCROLL
 
-    lda #%10000000
-    sta PPUCTRL     ; Re-enable NMI, background pattern table 0
+    lda #PPUCTRL_VAL
+    sta PPUCTRL
 
-    ; Restore registers
+    lda #%00011110       ; Show sprites + background, leftmost 8px
+    sta PPUMASK
+
+    ; Main loop: NMI does all the work
+Forever:
+    jmp Forever
+
+
+; ===== NMI: Called every VBlank (~60 Hz) =====
+; This is the game loop heartbeat.
+
+NMI:
+    pha
+    txa
+    pha
+    tya
+    pha
+
+    ; --- Step 1: OAM DMA ---
+    lda #$00
+    sta OAMADDR
+    lda #$02
+    sta OAMDMA
+
+    ; --- Step 2: Read controller ---
+    jsr ReadControllerSub
+
+    ; --- Step 3: Update facing direction ---
+    ; Check right first, then left. Last pressed wins if both held.
+    lda controller
+    and #%00000001       ; Right
+    beq @CheckLeftFace
+    lda #$00
+    sta facing_dir
+    jmp @FaceDone
+@CheckLeftFace:
+    lda controller
+    and #%00000010       ; Left
+    beq @FaceDone
+    lda #$01
+    sta facing_dir
+@FaceDone:
+
+    ; --- Step 4: Move player (left/right only) ---
+    jsr MovePlayer
+
+    ; --- Step 5: Update animation and draw metasprite ---
+    jsr UpdateAnimation
+
+    ; --- Step 6: Reset scroll ---
+    bit PPUSTATUS
+    lda #$00
+    sta PPUSCROLL
+    sta PPUSCROLL
+    lda #PPUCTRL_VAL
+    sta PPUCTRL
+
     pla
-    tay             ; Restore Y
+    tay
     pla
-    tax             ; Restore X
-    pla             ; Restore A
+    tax
+    pla
+    rti
 
-    rti             ; ReTurn from Interrupt
 
-
-; ===== IRQ: Hardware interrupt handler =====
-; Triggered by mapper hardware or the APU. We don't use it.
-
+; ===== IRQ =====
 IRQ:
     rti
+
+
+; ---------------------------------------------------------------------------
+; Subroutines
+; ---------------------------------------------------------------------------
+
+; --- ReadControllerSub ---
+; Reads controller 1 and packs button state into 'controller'.
+; Bit layout: A B Sel Start Up Down Left Right (bits 7..0)
+
+ReadControllerSub:
+    lda #$01
+    sta JOYPAD1
+    lda #$00
+    sta JOYPAD1
+
+    ldx #$08
+@Loop:
+    lda JOYPAD1
+    lsr a
+    rol controller
+    dex
+    bne @Loop
+    rts
+
+
+; --- MovePlayer ---
+; Moves the metasprite anchor position based on left/right input.
+; Movement speed: MOVE_SPEED pixels per frame.
+
+MovePlayer:
+    ; Check LEFT (bit 1)
+    lda controller
+    and #%00000010
+    beq @CheckRight
+    lda sprite_x
+    cmp #BOUND_LEFT
+    bcc @CheckRight
+    dec sprite_x
+    dec sprite_x
+@CheckRight:
+    lda controller
+    and #%00000001
+    beq @Done
+    lda sprite_x
+    cmp #BOUND_RIGHT
+    bcs @Done
+    inc sprite_x
+    inc sprite_x
+@Done:
+    rts
+
+
+; --- UpdateAnimation ---
+; Determines current animation state (idle vs running), advances the
+; animation timer, resolves the current frame, and calls DrawMetasprite.
+
+UpdateAnimation:
+    ; Determine desired state from input
+    lda controller
+    and #%00000011       ; Left or Right pressed?
+    bne @WantRun
+
+    ; --- Want idle ---
+    lda anim_state
+    beq @AlreadyIdle     ; Already idle? Skip transition
+    ; Transition to idle
+    lda #$00
+    sta anim_state
+    sta anim_frame
+    sta anim_timer
+@AlreadyIdle:
+    jmp @ResolveFrame
+
+@WantRun:
+    ; --- Want running ---
+    lda anim_state
+    bne @AlreadyRunning  ; Already running? Skip transition
+    ; Transition to running
+    lda #$01
+    sta anim_state
+    lda #$00
+    sta anim_frame
+    sta anim_timer
+@AlreadyRunning:
+
+    ; --- Advance animation timer ---
+    inc anim_timer
+    lda anim_timer
+    cmp #ANIM_SPEED_RUN
+    bcc @ResolveFrame    ; Timer hasn't reached threshold
+
+    ; Timer expired: advance to next frame
+    lda #$00
+    sta anim_timer
+    inc anim_frame
+
+    ; Wrap frame index (3 run frames: 0, 1, 2)
+    lda anim_frame
+    cmp #$03
+    bcc @ResolveFrame
+    lda #$00
+    sta anim_frame
+
+@ResolveFrame:
+    ; Look up the metasprite pointer for current state + frame
+    lda anim_state
+    bne @RunFrame
+
+    ; Idle: always use standing frame
+    lda #<MetaStand
+    sta meta_ptr
+    lda #>MetaStand
+    sta meta_ptr+1
+    jmp DrawMetasprite
+
+@RunFrame:
+    ; Running: index into run frame table
+    ldx anim_frame
+    lda RunFramesL, x
+    sta meta_ptr
+    lda RunFramesH, x
+    sta meta_ptr+1
+    jmp DrawMetasprite   ; Tail call (DrawMetasprite ends with rts)
+
+
+; --- DrawMetasprite ---
+; Reads the metasprite definition pointed to by meta_ptr and writes
+; hardware sprites to the OAM buffer at $0200.
+;
+; Handles horizontal flipping: if facing_dir is 1 (left), each sub-sprite
+; gets the H-flip attribute bit set and its X offset is mirrored.
+;
+; Uses Y as the read index into metasprite data, X as the write index
+; into the OAM buffer.
+
+DrawMetasprite:
+    ldx #$00             ; OAM write index
+    ldy #$00             ; Metasprite data read index
+
+@Loop:
+    lda (meta_ptr), y    ; Byte 0: Y offset (or $80 = end marker)
+    cmp #$80
+    beq @HideRest
+
+    ; --- Y position = sprite_y + y_offset ---
+    clc
+    adc sprite_y
+    sta $0200, x         ; OAM byte 0: Y position
+    iny
+
+    ; --- Tile index (straight copy) ---
+    lda (meta_ptr), y
+    sta $0201, x         ; OAM byte 1: tile index
+    iny
+
+    ; --- Attributes ---
+    lda (meta_ptr), y    ; Base attribute byte
+    pha                  ; Save it
+    lda facing_dir
+    beq @NoFlipAttr
+    pla
+    ora #FLIP_H          ; Set horizontal flip bit
+    pha
+@NoFlipAttr:
+    pla
+    sta $0202, x         ; OAM byte 2: attributes
+    iny
+
+    ; --- X position ---
+    ; If facing right: X = sprite_x + x_offset
+    ; If facing left:  X = sprite_x + (8 - x_offset)
+    ;   where 8 = (metasprite_width - tile_width) = (16 - 8)
+    lda facing_dir
+    bne @FlipX
+
+    ; Right-facing: simple add
+    lda (meta_ptr), y    ; x_offset
+    clc
+    adc sprite_x
+    jmp @StoreX
+
+@FlipX:
+    ; Left-facing: mirror the offset
+    lda #$08
+    sec
+    sbc (meta_ptr), y    ; A = 8 - x_offset
+    clc
+    adc sprite_x
+
+@StoreX:
+    sta $0203, x         ; OAM byte 3: X position
+    iny
+
+    ; Advance OAM index by 4 bytes (next hardware sprite slot)
+    inx
+    inx
+    inx
+    inx
+
+    jmp @Loop
+
+@HideRest:
+    ; Hide all remaining hardware sprites by setting Y = $FE (off-screen)
+    lda #$FE
+@HideLoop:
+    cpx #$00             ; X wrapped to 0 = all 64 sprites written
+    beq @HideDone
+    sta $0200, x         ; Set Y off-screen
+    inx
+    inx
+    inx
+    inx
+    bne @HideLoop        ; Loop until X wraps
+@HideDone:
+    rts
 
 
 ; ---------------------------------------------------------------------------
@@ -451,424 +502,243 @@ IRQ:
 
 ; --- Color Palette ---
 ; 32 bytes: 4 background palettes, then 4 sprite palettes.
-; Each palette is 4 bytes. Color $0 in each BG palette is shared as the
-; universal background color.
-;
-; NES colors are indices into a fixed 64-color palette. Some common values:
-;   $0F = black,  $30 = white,  $16 = red,    $11 = blue
-;   $1A = green,  $00 = gray,   $20 = white2,  $2D = dark gray
 
 PaletteData:
-    ; Background palette 0 (used for our text)
+    ; Background palette 0 (text)
     .byte $0F       ; Universal background color: black
-    .byte $30       ; Color 1: white (this is our text color)
-    .byte $16       ; Color 2: red   (unused in this demo)
-    .byte $1A       ; Color 3: green (unused in this demo)
+    .byte $30       ; Color 1: white (text color)
+    .byte $16       ; Color 2: red (unused)
+    .byte $1A       ; Color 3: green (unused)
 
-    ; Background palettes 1-3 (unused, but we must fill all 32 bytes)
+    ; Background palettes 1-3 (unused)
     .byte $0F,$30,$16,$1A
     .byte $0F,$30,$16,$1A
     .byte $0F,$30,$16,$1A
 
-    ; Sprite palette 0 (used for our player sprite)
-    .byte $0F       ; Color 0: transparent (uses universal BG color)
-    .byte $21       ; Color 1: light blue (sprite outline/fill)
-    .byte $30       ; Color 2: white (highlight)
-    .byte $16       ; Color 3: red (accent)
+    ; Sprite palette 0 (Mega Man)
+    ; Mapped to CHR color indices:
+    ;   Index 0: transparent
+    ;   Index 1: dark outline (near-black in CHR → NES $0F black)
+    ;   Index 2: body blue
+    ;   Index 3: skin/highlight
+    .byte $0F       ; Color 0: transparent (shows background)
+    .byte $0F       ; Color 1: black (outlines)
+    .byte $11       ; Color 2: medium blue (body)
+    .byte $36       ; Color 3: light peach (skin/highlights)
 
-    ; Sprite palettes 1-3 (unused, filled for completeness)
-    .byte $0F,$30,$16,$1A
-    .byte $0F,$30,$16,$1A
-    .byte $0F,$30,$16,$1A
+    ; Sprite palettes 1-3 (unused)
+    .byte $0F,$0F,$11,$36
+    .byte $0F,$0F,$11,$36
+    .byte $0F,$0F,$11,$36
 
 ; --- Message Data ---
-; These are tile indices, NOT ASCII codes. They correspond to the tiles
-; we define in CHR-ROM below. $FF marks end of string.
-;
-; Our tile layout: tile $00 = blank, then tiles $01-$1A = A-Z,
-; tile $21 = '!'. So:
-;   H=08, E=05, L=0C, L=0C, O=0F, (space)=00,
-;   W=17, O=0F, R=12, L=0C, D=04, !=21
+; Tile indices for "HELLO WORLD!" using background pattern table 0.
 
 MessageData:
     .byte $08,$05,$0C,$0C,$0F  ; H E L L O
-    .byte $00                   ; (space - blank tile)
+    .byte $00                   ; (space)
     .byte $17,$0F,$12,$0C,$04  ; W O R L D
     .byte $21                   ; !
     .byte $FF                   ; End marker
 
+; --- Metasprite Definitions ---
+; Each entry: Y-offset, Tile, Attribute, X-offset
+; Terminated by $80.
+;
+; Tile indices reference Pattern Table 1 (sprites).
+; Layout in CHR (128px wide = 16 tiles per row):
+;   Stand: tiles $00,$01 / $10,$11 / $20,$21
+;   Run1:  tiles $02,$03 / $12,$13 / $22,$23
+;   Run2:  tiles $04,$05 / $14,$15 / $24,$25
+;   Run3:  tiles $06,$07 / $16,$17 / $26,$27
+
+MetaStand:
+    .byte $00, $00, $00, $00   ; top-left
+    .byte $00, $01, $00, $08   ; top-right
+    .byte $08, $10, $00, $00   ; mid-left
+    .byte $08, $11, $00, $08   ; mid-right
+    .byte $10, $20, $00, $00   ; bot-left
+    .byte $10, $21, $00, $08   ; bot-right
+    .byte $80                   ; end
+
+MetaRun1:
+    .byte $00, $02, $00, $00   ; top-left
+    .byte $00, $03, $00, $08   ; top-right
+    .byte $08, $12, $00, $00   ; mid-left
+    .byte $08, $13, $00, $08   ; mid-right
+    .byte $10, $22, $00, $00   ; bot-left
+    .byte $10, $23, $00, $08   ; bot-right
+    .byte $80                   ; end
+
+MetaRun2:
+    .byte $00, $04, $00, $00   ; top-left
+    .byte $00, $05, $00, $08   ; top-right
+    .byte $08, $14, $00, $00   ; mid-left
+    .byte $08, $15, $00, $08   ; mid-right
+    .byte $10, $24, $00, $00   ; bot-left
+    .byte $10, $25, $00, $08   ; bot-right
+    .byte $80                   ; end
+
+MetaRun3:
+    .byte $00, $06, $00, $00   ; top-left
+    .byte $00, $07, $00, $08   ; top-right
+    .byte $08, $16, $00, $00   ; mid-left
+    .byte $08, $17, $00, $08   ; mid-right
+    .byte $10, $26, $00, $00   ; bot-left
+    .byte $10, $27, $00, $08   ; bot-right
+    .byte $80                   ; end
+
+; --- Animation Frame Pointer Tables ---
+; Used to look up the metasprite definition for each run frame.
+
+RunFramesL:
+    .byte <MetaRun1, <MetaRun2, <MetaRun3
+RunFramesH:
+    .byte >MetaRun1, >MetaRun2, >MetaRun3
+
+
 ; ---------------------------------------------------------------------------
 ; Interrupt Vectors
 ; ---------------------------------------------------------------------------
-; The 6502 has three hard-wired vectors at the top of memory:
-;   $FFFA-$FFFB = NMI vector   (called on VBlank)
-;   $FFFC-$FFFD = RESET vector (called on power-on/reset)
-;   $FFFE-$FFFF = IRQ vector   (called on hardware interrupt)
-;
-; These are 16-bit addresses (little-endian) pointing to our handlers.
 
 .segment "VECTORS"
 
-    .word NMI       ; $FFFA: NMI handler address
-    .word Reset     ; $FFFC: Reset handler address
-    .word IRQ       ; $FFFE: IRQ handler address
+    .word NMI
+    .word Reset
+    .word IRQ
+
 
 ; ---------------------------------------------------------------------------
 ; CHR-ROM: Graphics Tile Data
 ; ---------------------------------------------------------------------------
-; This is the actual pixel data for our tiles. The NES PPU uses 8x8 pixel
-; tiles, with each tile encoded as 16 bytes (2 "bit planes").
-;
-; Each tile is 8 rows. For each row, there are TWO bytes:
-;   - Plane 0 byte (low bit of each pixel's color)
-;   - Plane 1 byte (high bit of each pixel's color)
-;   Plane 0 comes first (8 bytes), then Plane 1 (8 bytes).
-;
-; The two planes combine to give a 2-bit color index (0-3) per pixel:
-;   Plane1 Plane0 -> Color
-;     0      0    ->   0  (background/transparent)
-;     0      1    ->   1
-;     1      0    ->   2
-;     1      1    ->   3
-;
-; For our font, we'll use color 0 (background) and color 1 (white).
-; That means Plane 1 is always $00, and Plane 0 holds the pixel pattern.
-;
-; IMPORTANT: The tile INDEX in the nametable corresponds to the tile's
-; position in CHR-ROM. Tile 0 is bytes 0-15, tile 1 is bytes 16-31, etc.
-;
-; Our layout:
-;   Tile $00 = blank (space)
-;   Tiles $01-$1A = letters A through Z
-;   Tiles $1B-$20 = unused
-;   Tile $21 = '!'
+; 8KB total: Pattern Table 0 (background) + Pattern Table 1 (sprites).
 
 .segment "CHARS"
 
-; --- Tile $00: Blank (space) ---
-.byte $00,$00,$00,$00,$00,$00,$00,$00  ; Plane 0: all pixels off
-.byte $00,$00,$00,$00,$00,$00,$00,$00  ; Plane 1: all zeros
+; === Pattern Table 0 ($0000-$0FFF): Background tiles ===
+; Font tiles for the "HELLO WORLD!" message.
+; Tile $00 = blank, $01-$1A = A-Z, $21 = '!'
+
+; --- Tile $00: Blank ---
+.byte $00,$00,$00,$00,$00,$00,$00,$00
+.byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $01: A ---
-.byte %00111100  ; Row 0:   ****
-.byte %01100110  ; Row 1:  **  **
-.byte %01100110  ; Row 2:  **  **
-.byte %01111110  ; Row 3:  ******
-.byte %01100110  ; Row 4:  **  **
-.byte %01100110  ; Row 5:  **  **
-.byte %01100110  ; Row 6:  **  **
-.byte %00000000  ; Row 7:  (empty)
-.byte $00,$00,$00,$00,$00,$00,$00,$00  ; Plane 1
+.byte %00111100,%01100110,%01100110,%01111110,%01100110,%01100110,%01100110,%00000000
+.byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $02: B ---
-.byte %01111100
-.byte %01100110
-.byte %01100110
-.byte %01111100
-.byte %01100110
-.byte %01100110
-.byte %01111100
-.byte %00000000
+.byte %01111100,%01100110,%01100110,%01111100,%01100110,%01100110,%01111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $03: C ---
-.byte %00111100
-.byte %01100110
-.byte %01100000
-.byte %01100000
-.byte %01100000
-.byte %01100110
-.byte %00111100
-.byte %00000000
+.byte %00111100,%01100110,%01100000,%01100000,%01100000,%01100110,%00111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $04: D ---
-.byte %01111000
-.byte %01101100
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01101100
-.byte %01111000
-.byte %00000000
+.byte %01111000,%01101100,%01100110,%01100110,%01100110,%01101100,%01111000,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $05: E ---
-.byte %01111110
-.byte %01100000
-.byte %01100000
-.byte %01111100
-.byte %01100000
-.byte %01100000
-.byte %01111110
-.byte %00000000
+.byte %01111110,%01100000,%01100000,%01111100,%01100000,%01100000,%01111110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $06: F ---
-.byte %01111110
-.byte %01100000
-.byte %01100000
-.byte %01111100
-.byte %01100000
-.byte %01100000
-.byte %01100000
-.byte %00000000
+.byte %01111110,%01100000,%01100000,%01111100,%01100000,%01100000,%01100000,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $07: G ---
-.byte %00111100
-.byte %01100110
-.byte %01100000
-.byte %01101110
-.byte %01100110
-.byte %01100110
-.byte %00111100
-.byte %00000000
+.byte %00111100,%01100110,%01100000,%01101110,%01100110,%01100110,%00111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $08: H ---
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01111110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %00000000
+.byte %01100110,%01100110,%01100110,%01111110,%01100110,%01100110,%01100110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $09: I ---
-.byte %00111100
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00111100
-.byte %00000000
+.byte %00111100,%00011000,%00011000,%00011000,%00011000,%00011000,%00111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $0A: J ---
-.byte %00011110
-.byte %00000110
-.byte %00000110
-.byte %00000110
-.byte %01100110
-.byte %01100110
-.byte %00111100
-.byte %00000000
+.byte %00011110,%00000110,%00000110,%00000110,%01100110,%01100110,%00111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $0B: K ---
-.byte %01100110
-.byte %01101100
-.byte %01111000
-.byte %01110000
-.byte %01111000
-.byte %01101100
-.byte %01100110
-.byte %00000000
+.byte %01100110,%01101100,%01111000,%01110000,%01111000,%01101100,%01100110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $0C: L ---
-.byte %01100000
-.byte %01100000
-.byte %01100000
-.byte %01100000
-.byte %01100000
-.byte %01100000
-.byte %01111110
-.byte %00000000
+.byte %01100000,%01100000,%01100000,%01100000,%01100000,%01100000,%01111110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $0D: M ---
-.byte %01100011
-.byte %01110111
-.byte %01111111
-.byte %01101011
-.byte %01100011
-.byte %01100011
-.byte %01100011
-.byte %00000000
+.byte %01100011,%01110111,%01111111,%01101011,%01100011,%01100011,%01100011,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $0E: N ---
-.byte %01100110
-.byte %01110110
-.byte %01111110
-.byte %01111110
-.byte %01101110
-.byte %01100110
-.byte %01100110
-.byte %00000000
+.byte %01100110,%01110110,%01111110,%01111110,%01101110,%01100110,%01100110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $0F: O ---
-.byte %00111100
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %00111100
-.byte %00000000
+.byte %00111100,%01100110,%01100110,%01100110,%01100110,%01100110,%00111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $10: P ---
-.byte %01111100
-.byte %01100110
-.byte %01100110
-.byte %01111100
-.byte %01100000
-.byte %01100000
-.byte %01100000
-.byte %00000000
+.byte %01111100,%01100110,%01100110,%01111100,%01100000,%01100000,%01100000,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $11: Q ---
-.byte %00111100
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01101010
-.byte %01101100
-.byte %00110110
-.byte %00000000
+.byte %00111100,%01100110,%01100110,%01100110,%01101010,%01101100,%00110110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $12: R ---
-.byte %01111100
-.byte %01100110
-.byte %01100110
-.byte %01111100
-.byte %01111000
-.byte %01101100
-.byte %01100110
-.byte %00000000
+.byte %01111100,%01100110,%01100110,%01111100,%01111000,%01101100,%01100110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $13: S ---
-.byte %00111100
-.byte %01100110
-.byte %01110000
-.byte %00111100
-.byte %00001110
-.byte %01100110
-.byte %00111100
-.byte %00000000
+.byte %00111100,%01100110,%01110000,%00111100,%00001110,%01100110,%00111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $14: T ---
-.byte %01111110
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00000000
+.byte %01111110,%00011000,%00011000,%00011000,%00011000,%00011000,%00011000,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $15: U ---
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %00111100
-.byte %00000000
+.byte %01100110,%01100110,%01100110,%01100110,%01100110,%01100110,%00111100,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $16: V ---
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %00111100
-.byte %00011000
-.byte %00000000
+.byte %01100110,%01100110,%01100110,%01100110,%01100110,%00111100,%00011000,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $17: W ---
-.byte %01100011
-.byte %01100011
-.byte %01100011
-.byte %01101011
-.byte %01111111
-.byte %01110111
-.byte %01100011
-.byte %00000000
+.byte %01100011,%01100011,%01100011,%01101011,%01111111,%01110111,%01100011,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $18: X ---
-.byte %01100110
-.byte %01100110
-.byte %00111100
-.byte %00011000
-.byte %00111100
-.byte %01100110
-.byte %01100110
-.byte %00000000
+.byte %01100110,%01100110,%00111100,%00011000,%00111100,%01100110,%01100110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $19: Y ---
-.byte %01100110
-.byte %01100110
-.byte %01100110
-.byte %00111100
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00000000
+.byte %01100110,%01100110,%01100110,%00111100,%00011000,%00011000,%00011000,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
 ; --- Tile $1A: Z ---
-.byte %01111110
-.byte %00000110
-.byte %00001100
-.byte %00011000
-.byte %00110000
-.byte %01100000
-.byte %01111110
-.byte %00000000
+.byte %01111110,%00000110,%00001100,%00011000,%00110000,%01100000,%01111110,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
-; --- Tiles $1B-$20: Unused (padding to reach tile $21) ---
-; Each tile is 16 bytes. We need 6 tiles of padding (6 x 16 = 96 bytes).
+; --- Tiles $1B-$20: Unused padding ---
 .res 96, $00
 
-; --- Tile $21: ! (exclamation mark) ---
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00011000
-.byte %00000000
-.byte %00011000
-.byte %00000000
+; --- Tile $21: ! ---
+.byte %00011000,%00011000,%00011000,%00011000,%00011000,%00000000,%00011000,%00000000
 .byte $00,$00,$00,$00,$00,$00,$00,$00
 
-; --- Tile $22: Player sprite (small diamond/arrow character) ---
-; A simple 8x8 character: diamond shape with eyes.
-; Uses color 1 (light blue) for the body and color 2 (white) for eyes.
-;
-; Plane 0 (low bit):
-.byte %00011000  ; Row 0:    **
-.byte %00111100  ; Row 1:   ****
-.byte %01111110  ; Row 2:  ******
-.byte %01100110  ; Row 3:  **  **    (eyes are color 2, body color 1)
-.byte %01111110  ; Row 4:  ******
-.byte %01111110  ; Row 5:  ******
-.byte %00111100  ; Row 6:   ****
-.byte %00011000  ; Row 7:    **
-; Plane 1 (high bit):
-.byte %00000000  ; Row 0
-.byte %00000000  ; Row 1
-.byte %00000000  ; Row 2
-.byte %00011000  ; Row 3:    **      (eyes: plane1=1, plane0=0 → color 2)
-.byte %00000000  ; Row 4
-.byte %00000000  ; Row 5
-.byte %00000000  ; Row 6
-.byte %00000000  ; Row 7
+; --- Pad rest of Pattern Table 0 to exactly 4096 bytes ---
+; Tiles $00-$21 = 34 tiles = 544 bytes. Need 4096 - 544 = 3552 bytes.
+.res 3552, $00
+
+; === Pattern Table 1 ($1000-$1FFF): Sprite tiles ===
+; Mega Man poses extracted by tools/extract_poses.py.
+; See tile index layout in the metasprite definitions above.
+.incbin "assets/chr/megaman_sprites.chr"
