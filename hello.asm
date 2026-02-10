@@ -61,6 +61,12 @@ FLIP_H          = %01000000  ; Horizontal flip
 BOUND_LEFT      = $02
 BOUND_RIGHT     = $EE        ; 238 = 256 - 16 - 2
 
+; Physics constants
+GRAVITY         = 1          ; Added to vel_y each frame
+JUMP_VELOCITY   = $F4        ; -12 in two's complement (upward)
+GROUND_Y        = 200        ; Y position of the floor
+TERMINAL_VEL    = 5          ; Maximum falling speed
+
 ; ---------------------------------------------------------------------------
 ; iNES Header
 ; ---------------------------------------------------------------------------
@@ -99,6 +105,10 @@ anim_timer: .res 1   ; Frame counter until next animation tick
 
 ; Metasprite rendering
 meta_ptr:   .res 2   ; 16-bit pointer to current metasprite data (lo, hi)
+
+; Physics state
+vel_y:      .res 1   ; Vertical velocity (signed: negative=up, positive=down)
+on_ground:  .res 1   ; 1 = on ground, 0 = in air
 
 ; ---------------------------------------------------------------------------
 ; Main Code
@@ -191,6 +201,9 @@ DoneMessage:
     sta anim_state       ; Idle
     sta anim_frame       ; Frame 0
     sta anim_timer       ; Timer at 0
+    sta vel_y            ; No vertical velocity
+    lda #$01
+    sta on_ground        ; Start on ground
 
     ; --- Draw initial metasprite to OAM buffer ---
     lda #<MetaStand
@@ -254,10 +267,14 @@ NMI:
     ; --- Step 4: Move player (left/right only) ---
     jsr MovePlayer
 
-    ; --- Step 5: Update animation and draw metasprite ---
+    ; --- Step 5: Handle jumping and gravity ---
+    jsr HandleJump
+    jsr ApplyGravity
+
+    ; --- Step 6: Update animation and draw metasprite ---
     jsr UpdateAnimation
 
-    ; --- Step 6: Reset scroll ---
+    ; --- Step 7: Reset scroll ---
     bit PPUSTATUS
     lda #$00
     sta PPUSCROLL
@@ -325,6 +342,76 @@ MovePlayer:
     bcs @Done
     inc sprite_x
     inc sprite_x
+@Done:
+    rts
+
+
+; --- HandleJump ---
+; Initiates a jump when A is pressed and player is on ground.
+
+HandleJump:
+    ; Check if on ground
+    lda on_ground
+    beq @Done               ; Not on ground, can't jump
+
+    ; Check if A button pressed (bit 7)
+    lda controller
+    bpl @Done               ; A not pressed (bit 7 = 0)
+
+    ; Start jump: set upward velocity, leave ground
+    lda #JUMP_VELOCITY
+    sta vel_y
+    lda #$00
+    sta on_ground
+
+@Done:
+    rts
+
+
+; --- ApplyGravity ---
+; Applies gravity to velocity, updates Y position, handles ground collision.
+
+ApplyGravity:
+    ; If on ground and not jumping, skip gravity
+    lda on_ground
+    bne @Done
+
+    ; Apply gravity: vel_y += GRAVITY
+    lda vel_y
+    clc
+    adc #GRAVITY
+    sta vel_y
+
+    ; Clamp to terminal velocity (only when falling, i.e., vel_y > 0)
+    ; Check if vel_y is positive and > TERMINAL_VEL
+    bmi @ApplyVelocity      ; Negative = still rising, don't clamp
+    cmp #TERMINAL_VEL
+    bcc @ApplyVelocity      ; Less than terminal, ok
+    beq @ApplyVelocity      ; Equal to terminal, ok
+    lda #TERMINAL_VEL       ; Clamp to terminal velocity
+    sta vel_y
+
+@ApplyVelocity:
+    ; Add vel_y to sprite_y (signed addition)
+    lda sprite_y
+    clc
+    adc vel_y
+    sta sprite_y
+
+    ; Check for ground collision
+    ; If sprite_y >= GROUND_Y, land
+    lda sprite_y
+    cmp #GROUND_Y
+    bcc @Done               ; sprite_y < GROUND_Y, still in air
+
+    ; Land on ground
+    lda #GROUND_Y
+    sta sprite_y
+    lda #$00
+    sta vel_y
+    lda #$01
+    sta on_ground
+
 @Done:
     rts
 
