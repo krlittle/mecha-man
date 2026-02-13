@@ -110,6 +110,9 @@ meta_ptr:   .res 2   ; 16-bit pointer to current metasprite data (lo, hi)
 vel_y:      .res 1   ; Vertical velocity (signed: negative=up, positive=down)
 on_ground:  .res 1   ; 1 = on ground, 0 = in air
 
+; Scrolling
+scroll_x:   .res 1   ; Background scroll X position (0-255)
+
 ; ---------------------------------------------------------------------------
 ; Main Code
 ; ---------------------------------------------------------------------------
@@ -202,6 +205,7 @@ DoneMessage:
     sta anim_frame       ; Frame 0
     sta anim_timer       ; Timer at 0
     sta vel_y            ; No vertical velocity
+    sta scroll_x         ; No scroll offset
     lda #$01
     sta on_ground        ; Start on ground
 
@@ -274,11 +278,15 @@ NMI:
     ; --- Step 6: Update animation and draw metasprite ---
     jsr UpdateAnimation
 
-    ; --- Step 7: Reset scroll ---
+    ; --- Step 7: Update camera/scroll ---
+    jsr UpdateCamera
+
+    ; --- Step 8: Apply scroll to PPU ---
     bit PPUSTATUS
+    lda scroll_x
+    sta PPUSCROLL          ; X scroll
     lda #$00
-    sta PPUSCROLL
-    sta PPUSCROLL
+    sta PPUSCROLL          ; Y scroll (fixed at 0)
     lda #PPUCTRL_VAL
     sta PPUCTRL
 
@@ -416,6 +424,17 @@ ApplyGravity:
     rts
 
 
+; --- UpdateCamera ---
+; Updates scroll position based on player position.
+; Simple version: scroll = sprite_x / 2 (parallax effect)
+
+UpdateCamera:
+    lda sprite_x
+    lsr a              ; Divide by 2
+    sta scroll_x
+    rts
+
+
 ; --- UpdateAnimation ---
 ; Determines current animation state (idle vs running), advances the
 ; animation timer, resolves the current frame, and calls DrawMetasprite.
@@ -460,9 +479,9 @@ UpdateAnimation:
     sta anim_timer
     inc anim_frame
 
-    ; Wrap frame index (3 run frames: 0, 1, 2)
+    ; Wrap frame index (6 run frames: 0-5)
     lda anim_frame
-    cmp #$03
+    cmp #$06
     bcc @ResolveFrame
     lda #$00
     sta anim_frame
@@ -675,13 +694,40 @@ MetaRun3:
     .byte $10, $27, $00, $08   ; bot-right
     .byte $80                   ; end
 
+MetaRun4:
+    .byte $00, $08, $00, $00   ; top-left
+    .byte $00, $09, $00, $08   ; top-right
+    .byte $08, $18, $00, $00   ; mid-left
+    .byte $08, $19, $00, $08   ; mid-right
+    .byte $10, $28, $00, $00   ; bot-left
+    .byte $10, $29, $00, $08   ; bot-right
+    .byte $80                   ; end
+
+MetaRun5:
+    .byte $00, $0A, $00, $00   ; top-left
+    .byte $00, $0B, $00, $08   ; top-right
+    .byte $08, $1A, $00, $00   ; mid-left
+    .byte $08, $1B, $00, $08   ; mid-right
+    .byte $10, $2A, $00, $00   ; bot-left
+    .byte $10, $2B, $00, $08   ; bot-right
+    .byte $80                   ; end
+
+MetaRun6:
+    .byte $00, $0C, $00, $00   ; top-left
+    .byte $00, $0D, $00, $08   ; top-right
+    .byte $08, $1C, $00, $00   ; mid-left
+    .byte $08, $1D, $00, $08   ; mid-right
+    .byte $10, $2C, $00, $00   ; bot-left
+    .byte $10, $2D, $00, $08   ; bot-right
+    .byte $80                   ; end
+
 ; --- Animation Frame Pointer Tables ---
 ; Used to look up the metasprite definition for each run frame.
 
 RunFramesL:
-    .byte <MetaRun1, <MetaRun2, <MetaRun3
+    .byte <MetaRun1, <MetaRun2, <MetaRun3, <MetaRun4, <MetaRun5, <MetaRun6
 RunFramesH:
-    .byte >MetaRun1, >MetaRun2, >MetaRun3
+    .byte >MetaRun1, >MetaRun2, >MetaRun3, >MetaRun4, >MetaRun5, >MetaRun6
 
 
 ; ---------------------------------------------------------------------------
