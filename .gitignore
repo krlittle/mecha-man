@@ -6,3 +6,6 @@
 
 # Session logs (local reference only)
 sessions/
+
+# Compiled python bytecode
+**/__pycache__/
