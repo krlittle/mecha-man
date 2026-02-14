@@ -2,15 +2,15 @@
 ; Mecha Man - NES ROM
 ; ============================================================================
 ;
-; Displays "HELLO WORLD!" on the background and a Mega Man character that
+; Displays "HELLO WORLD!" on the background and a Mario character that
 ; can run left and right using the D-pad. Features:
-;   - Multi-tile metasprites (2x3 = 16x24 pixel character)
+;   - Multi-tile metasprites (2x2 = 16x16 pixel character)
 ;   - Standing and running animation
 ;   - Horizontal flip for left/right facing
 ;
 ; CHR-ROM layout:
 ;   Pattern Table 0 ($0000-$0FFF): Background tiles (font A-Z, etc.)
-;   Pattern Table 1 ($1000-$1FFF): Sprite tiles (Mega Man poses)
+;   Pattern Table 1 ($1000-$1FFF): Sprite tiles (Mario poses)
 ;
 ; ============================================================================
 
@@ -57,7 +57,7 @@ MOVE_SPEED      = 2     ; Pixels per frame
 ; Sprite attribute bits
 FLIP_H          = %01000000  ; Horizontal flip
 
-; Screen bounds (accounting for 16x24 metasprite)
+; Screen bounds (accounting for 16x16 metasprite)
 BOUND_LEFT      = $02
 BOUND_RIGHT     = $EE        ; 238 = 256 - 16 - 2
 
@@ -479,9 +479,9 @@ UpdateAnimation:
     sta anim_timer
     inc anim_frame
 
-    ; Wrap frame index (6 run frames: 0-5)
+    ; Wrap frame index (3 run frames: 0-2)
     lda anim_frame
-    cmp #$06
+    cmp #$03
     bcc @ResolveFrame
     lda #$00
     sta anim_frame
@@ -653,81 +653,45 @@ MessageData:
 ;
 ; Tile indices reference Pattern Table 1 (sprites).
 ; Layout in CHR (128px wide = 16 tiles per row):
-;   Stand: tiles $00,$01 / $10,$11 / $20,$21
-;   Run1:  tiles $02,$03 / $12,$13 / $22,$23
-;   Run2:  tiles $04,$05 / $14,$15 / $24,$25
-;   Run3:  tiles $06,$07 / $16,$17 / $26,$27
+;   Frame 0 (stand/run1): tiles $00,$01 / $10,$11
+;   Frame 1 (run2):       tiles $02,$03 / $12,$13
+;   Frame 2 (run3):       tiles $04,$05 / $14,$15
 
 MetaStand:
     .byte $00, $00, $00, $00   ; top-left
     .byte $00, $01, $00, $08   ; top-right
-    .byte $08, $10, $00, $00   ; mid-left
-    .byte $08, $11, $00, $08   ; mid-right
-    .byte $10, $20, $00, $00   ; bot-left
-    .byte $10, $21, $00, $08   ; bot-right
+    .byte $08, $10, $00, $00   ; bot-left
+    .byte $08, $11, $00, $08   ; bot-right
     .byte $80                   ; end
 
 MetaRun1:
-    .byte $00, $02, $00, $00   ; top-left
-    .byte $00, $03, $00, $08   ; top-right
-    .byte $08, $12, $00, $00   ; mid-left
-    .byte $08, $13, $00, $08   ; mid-right
-    .byte $10, $22, $00, $00   ; bot-left
-    .byte $10, $23, $00, $08   ; bot-right
+    .byte $00, $00, $00, $00   ; top-left
+    .byte $00, $01, $00, $08   ; top-right
+    .byte $08, $10, $00, $00   ; bot-left
+    .byte $08, $11, $00, $08   ; bot-right
     .byte $80                   ; end
 
 MetaRun2:
-    .byte $00, $04, $00, $00   ; top-left
-    .byte $00, $05, $00, $08   ; top-right
-    .byte $08, $14, $00, $00   ; mid-left
-    .byte $08, $15, $00, $08   ; mid-right
-    .byte $10, $24, $00, $00   ; bot-left
-    .byte $10, $25, $00, $08   ; bot-right
+    .byte $00, $02, $00, $00   ; top-left
+    .byte $00, $03, $00, $08   ; top-right
+    .byte $08, $12, $00, $00   ; bot-left
+    .byte $08, $13, $00, $08   ; bot-right
     .byte $80                   ; end
 
 MetaRun3:
-    .byte $00, $06, $00, $00   ; top-left
-    .byte $00, $07, $00, $08   ; top-right
-    .byte $08, $16, $00, $00   ; mid-left
-    .byte $08, $17, $00, $08   ; mid-right
-    .byte $10, $26, $00, $00   ; bot-left
-    .byte $10, $27, $00, $08   ; bot-right
-    .byte $80                   ; end
-
-MetaRun4:
-    .byte $00, $08, $00, $00   ; top-left
-    .byte $00, $09, $00, $08   ; top-right
-    .byte $08, $18, $00, $00   ; mid-left
-    .byte $08, $19, $00, $08   ; mid-right
-    .byte $10, $28, $00, $00   ; bot-left
-    .byte $10, $29, $00, $08   ; bot-right
-    .byte $80                   ; end
-
-MetaRun5:
-    .byte $00, $0A, $00, $00   ; top-left
-    .byte $00, $0B, $00, $08   ; top-right
-    .byte $08, $1A, $00, $00   ; mid-left
-    .byte $08, $1B, $00, $08   ; mid-right
-    .byte $10, $2A, $00, $00   ; bot-left
-    .byte $10, $2B, $00, $08   ; bot-right
-    .byte $80                   ; end
-
-MetaRun6:
-    .byte $00, $0C, $00, $00   ; top-left
-    .byte $00, $0D, $00, $08   ; top-right
-    .byte $08, $1C, $00, $00   ; mid-left
-    .byte $08, $1D, $00, $08   ; mid-right
-    .byte $10, $2C, $00, $00   ; bot-left
-    .byte $10, $2D, $00, $08   ; bot-right
+    .byte $00, $04, $00, $00   ; top-left
+    .byte $00, $05, $00, $08   ; top-right
+    .byte $08, $14, $00, $00   ; bot-left
+    .byte $08, $15, $00, $08   ; bot-right
     .byte $80                   ; end
 
 ; --- Animation Frame Pointer Tables ---
 ; Used to look up the metasprite definition for each run frame.
 
 RunFramesL:
-    .byte <MetaRun1, <MetaRun2, <MetaRun3, <MetaRun4, <MetaRun5, <MetaRun6
+    .byte <MetaRun1, <MetaRun2, <MetaRun3
 RunFramesH:
-    .byte >MetaRun1, >MetaRun2, >MetaRun3, >MetaRun4, >MetaRun5, >MetaRun6
+    .byte >MetaRun1, >MetaRun2, >MetaRun3
 
 
 ; ---------------------------------------------------------------------------
@@ -872,6 +836,6 @@ RunFramesH:
 .res 3552, $00
 
 ; === Pattern Table 1 ($1000-$1FFF): Sprite tiles ===
-; Mega Man poses extracted by tools/extract_poses.py.
+; Mario poses extracted by tools/extract_gif_frames.py.
 ; See tile index layout in the metasprite definitions above.
-.incbin "assets/chr/megaman_sprites.chr"
+.incbin "assets/chr/mario_sprites.chr"
