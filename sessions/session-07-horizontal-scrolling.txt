@@ -1,0 +1,363 @@
+Session 07: True Horizontal Scrolling
+Date: 2026-02-14
+================================================================================
+
+GOAL
+----
+Implement true horizontal side-scrolling with a 2-screen-wide level, metatile-
+based level data, dead zone camera following, and dynamic seam column updates
+as new content scrolls into view.
+
+================================================================================
+
+VERTICAL VS HORIZONTAL MIRRORING
+--------------------------------
+The NES has 2KB of VRAM for nametables, enough for 2 screens. The cartridge
+chooses how to arrange them via the mirroring mode in the iNES header:
+
+    Horizontal mirroring (flag $00):
+        NT0 | NT0    (left-right are same)
+        NT1 | NT1    (top-bottom are same)
+        → Good for vertical scrolling (up/down platformers)
+
+    Vertical mirroring (flag $01):
+        NT0 | NT1    (left-right are different)
+        NT0 | NT1    (top-bottom mirror)
+        → Good for horizontal scrolling (side-scrollers)
+
+For horizontal scrolling, we need vertical mirroring so NT0 and NT1 form a
+horizontally continuous space (512 pixels wide). The iNES header byte 6 is
+set to $01 to enable vertical mirroring.
+
+================================================================================
+
+16-BIT WORLD COORDINATES
+------------------------
+A single byte can only represent 0-255, but our level is 512 pixels wide.
+Player position is tracked with 16-bit world coordinates:
+
+    player_world_x_lo: .res 1   ; Low byte (0-255)
+    player_world_x_hi: .res 1   ; High byte (0-1 for 2 screens)
+
+Camera position also uses 16 bits:
+
+    camera_x_lo: .res 1
+    camera_x_hi: .res 1
+
+The screen position (what we write to OAM) is the difference:
+
+    sprite_x = player_world_x - camera_x
+
+Since the screen is 256 pixels wide and the camera follows the player,
+sprite_x fits in 8 bits.
+
+16-bit subtraction in 6502:
+
+    lda player_world_x_lo
+    sec
+    sbc camera_x_lo
+    sta sprite_x           ; Result is 8-bit screen position
+
+================================================================================
+
+DEAD ZONE CAMERA
+----------------
+A "dead zone" is a region in the center of the screen where the player can
+move freely without the camera following. This prevents jittery scrolling
+when making small movements.
+
+Constants define the dead zone edges:
+
+    CAMERA_LEFT_EDGE  = $50      ; 80 pixels from left
+    CAMERA_RIGHT_EDGE = $A0      ; 160 pixels from left
+
+The UpdateCamera subroutine:
+
+1. Calculates sprite_x from world position
+2. If sprite_x < CAMERA_LEFT_EDGE: shift camera left
+3. If sprite_x > CAMERA_RIGHT_EDGE: shift camera right
+4. Otherwise: camera stays still (player in dead zone)
+
+When camera shifts, it's set so the player is exactly at the edge:
+
+    ; Player left of dead zone
+    camera_x = player_world_x - CAMERA_LEFT_EDGE
+
+    ; Player right of dead zone
+    camera_x = player_world_x - CAMERA_RIGHT_EDGE
+
+The camera is clamped to [0, LEVEL_WIDTH - 256] to prevent showing garbage
+beyond the level boundaries.
+
+================================================================================
+
+METATILE SYSTEM
+---------------
+Storing levels as raw 8x8 tiles wastes space. A 2-screen level is:
+    64 columns × 30 rows = 1920 tiles
+
+Metatiles are 16x16 pixel blocks (2×2 NES tiles). Benefits:
+
+    - 4× compression: 32 metatile columns × 15 rows = 480 bytes
+    - Easier level design: think in 16×16 blocks, not 8×8 pixels
+    - Collision detection aligns naturally with metatile grid
+
+MetatileDefs table defines what each metatile looks like:
+
+    MetatileDefs:
+        ; Metatile 0: Sky (all blank)
+        .byte $00, $00, $00, $00     ; TL, TR, BL, BR
+
+        ; Metatile 1: Ground
+        .byte $1B, $1B, $1C, $1C     ; Grass top, dirt bottom
+
+        ; Metatile 2: Platform
+        .byte $1D, $1D, $00, $00     ; Platform tiles, empty below
+
+Level data uses metatile indices:
+
+    SKY = 0
+    GND = 1
+    PLT = 2
+
+    Level1Data:
+        .byte SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,GND,GND  ; Col 0
+        ; ... 31 more columns
+
+================================================================================
+
+COLUMN-MAJOR LEVEL DATA
+-----------------------
+For horizontal scrolling, we need to update one column at a time as it
+scrolls into view. Storing data column-major (not row-major) makes this
+efficient:
+
+    Level1Data:
+        ; Column 0: 15 metatiles top-to-bottom
+        .byte SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,GND,GND
+        ; Column 1: 15 metatiles
+        .byte SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,SKY,GND,GND
+        ; ... and so on
+
+Each column is 15 bytes (15 metatiles = 30 tile rows = 240 pixels).
+To access column N: Level1Data + (N × 15).
+
+================================================================================
+
+SEAM BUFFER SYSTEM
+------------------
+When scrolling right, the rightmost column of the upcoming nametable needs
+to be drawn before it becomes visible. This is called the "seam."
+
+The seam buffer holds one column of tiles (30 bytes) prepared during game
+logic, then written to the PPU during vblank.
+
+Zero page variables:
+
+    prev_scroll_col: .res 1   ; Last drawn column (0-63)
+    col_to_draw:     .res 1   ; Next column to draw
+    seam_ready:      .res 1   ; Flag: buffer ready to write
+
+BSS memory:
+
+    seam_buffer:     .res 30  ; One column of NES tiles
+
+PrepareSeam subroutine (called every frame):
+
+1. Calculate current leftmost tile column from camera position:
+       left_col = (camera_x_hi << 5) | (camera_x_lo >> 3)
+
+2. Compare to previous column. If unchanged, nothing to draw.
+
+3. If column changed, calculate seam column:
+       seam_col = (left_col + 32) & $3F
+   (32 columns ahead, wrapped to 64-column space)
+
+4. Find which metatile column this tile column belongs to:
+       metatile_col = seam_col >> 1
+
+5. Calculate level data pointer:
+       ptr = Level1Data + (metatile_col × 15)
+
+6. Determine if drawing left or right half of metatile:
+       is_right = seam_col & 1
+
+7. Fill seam_buffer by expanding metatiles to tiles.
+
+================================================================================
+
+NMI VBLANK TIMING
+-----------------
+Vblank is short (~2270 CPU cycles). PPU writes MUST happen first:
+
+    NMI:
+        ; === VBLANK-CRITICAL: PPU writes only ===
+        ; 1. OAM DMA (highest priority)
+        lda #$00
+        sta OAMADDR
+        lda #$02
+        sta OAMDMA
+
+        ; 2. Write seam column if ready
+        lda seam_ready
+        beq @SkipSeam
+        jsr WriteSeam
+        lda #$00
+        sta seam_ready
+    @SkipSeam:
+
+        ; 3. Set scroll (must be last PPU write)
+        bit PPUSTATUS
+        lda camera_x_lo
+        sta PPUSCROLL
+        lda #$00
+        sta PPUSCROLL
+        lda #PPUCTRL_VAL
+        ora scroll_x_hi        ; Nametable select bit
+        sta PPUCTRL
+
+        ; === GAME LOGIC: Can run outside vblank ===
+        jsr ReadControllerSub
+        jsr MovePlayer
+        ; ... etc
+
+If game logic runs too long and bleeds into rendering, artifacts appear.
+Keeping PPU writes first ensures they complete during vblank.
+
+================================================================================
+
+PPUCTRL VERTICAL INCREMENT
+--------------------------
+Normally, each PPUDATA write advances the PPU address by 1 (horizontal).
+For writing a vertical column, set bit 2 of PPUCTRL:
+
+    lda #%10001100       ; Bit 2 = 1: vertical increment (+32)
+    sta PPUCTRL
+
+Now each write advances by 32 (one row down in the nametable).
+
+WriteSeam uses this to write 30 tiles as a single column:
+
+    WriteSeam:
+        ; Calculate PPU address
+        lda col_to_draw
+        and #$20             ; NT0 ($2000) or NT1 ($2400)?
+        beq @UseNT0
+        lda #$24
+        jmp @SetNT
+    @UseNT0:
+        lda #$20
+    @SetNT:
+        sta temp2            ; High byte
+
+        lda col_to_draw
+        and #$1F             ; Column within NT (0-31)
+        sta temp             ; Low byte
+
+        bit PPUSTATUS
+        lda temp2
+        sta PPUADDR
+        lda temp
+        sta PPUADDR
+
+        ; Vertical increment mode
+        lda #%10001100
+        sta PPUCTRL
+
+        ; Write 30 tiles
+        ldx #$00
+    @Loop:
+        lda seam_buffer, x
+        sta PPUDATA
+        inx
+        cpx #30
+        bne @Loop
+
+        ; Restore horizontal increment
+        lda #PPUCTRL_VAL
+        sta PPUCTRL
+        rts
+
+================================================================================
+
+NAMETABLE SELECT BIT
+--------------------
+When camera_x exceeds 256, we're viewing nametable 1. The nametable select
+is stored in bits 0-1 of PPUCTRL. For horizontal scrolling, only bit 0
+matters:
+
+    ; Set scroll_x_hi from camera high byte
+    lda camera_x_hi
+    and #$01
+    sta scroll_x_hi
+
+    ; Apply to PPUCTRL
+    lda #PPUCTRL_VAL
+    ora scroll_x_hi        ; Add nametable bit
+    sta PPUCTRL
+
+This makes scrolling seamless across the nametable boundary.
+
+================================================================================
+
+DRAWLEVEL FOR INITIAL SETUP
+---------------------------
+At startup (rendering disabled), the entire level is drawn to both nametables.
+This happens once and uses vertical increment mode to efficiently write columns.
+
+DrawLevel iterates through 32 metatile columns, expanding each to 2 tile
+columns, writing to NT0 (columns 0-15) then NT1 (columns 16-31).
+
+After initial draw, only the seam system updates tiles during gameplay.
+
+================================================================================
+
+WORLD BOUNDS CHECKING
+---------------------
+MovePlayer uses 16-bit comparison to prevent walking off the level:
+
+    WORLD_LEFT_LO   = $02        ; Left bound (2 pixels in)
+    WORLD_LEFT_HI   = $00
+    WORLD_RIGHT_LO  = $EE        ; Right bound (512 - 16 - 2 = 494)
+    WORLD_RIGHT_HI  = $01
+
+16-bit compare checks high byte first, then low byte:
+
+    lda player_world_x_hi
+    cmp #WORLD_RIGHT_HI
+    bcc @CanMoveRight       ; High byte less: definitely ok
+    bne @AtRightBound       ; High byte greater: at bound
+    lda player_world_x_lo
+    cmp #WORLD_RIGHT_LO
+    bcs @AtRightBound       ; Low byte >= bound: at bound
+
+================================================================================
+
+FILES MODIFIED
+--------------
+  hello.asm    MOD  Complete scrolling system: 16-bit coords, camera,
+                    metatiles, seam updates, level data
+  nes.cfg      MOD  Vertical mirroring (if changed)
+
+================================================================================
+
+TESTING
+-------
+Load hello.nes in an NES emulator:
+  - Player can walk 2 screens left and right
+  - Background scrolls smoothly as player moves
+  - Dead zone: background doesn't move when player is centered
+  - Pit obstacle visible (columns 8-11 have no ground)
+  - Platform visible (elevated metatile near columns 13-14, 18-19)
+  - No visual glitches at screen boundary (seam updates working)
+  - Player stops at world boundaries (can't walk off level)
+
+================================================================================
+
+NEXT STEPS
+----------
+  - Collision detection with metatiles (can't walk through platforms)
+  - Falling into pits triggers death/respawn
+  - More varied level terrain
+  - Multiple screen-height jumps to reach platforms
+  - Enemies that scroll with the level

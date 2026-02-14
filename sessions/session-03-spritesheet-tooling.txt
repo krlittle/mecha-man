@@ -1,0 +1,262 @@
+Session 03: Spritesheet Tooling & Multi-Tile Sprites
+Date: 2026-01-30
+================================================================================
+
+GOAL
+----
+Build a toolchain for converting external spritesheet artwork into NES-ready
+CHR-ROM data. This bridges the gap between drawing sprites in a modern image
+editor and getting them into the NES's tile format.
+
+Also introduced the concept of multi-tile sprites (metasprites) as the next
+step toward building a real game character.
+
+================================================================================
+
+WHAT ARE METASPRITES?
+---------------------
+The NES PPU only supports 8x8 pixel hardware sprites. Real game characters
+(like Mega Man) are much larger — typically 16x16 or 24x24 pixels. To display
+a larger character, you arrange multiple hardware sprites next to each other
+so they LOOK like one big sprite. This grouping is called a "metasprite."
+
+For a 16x16 character, you use 4 hardware sprites in a 2x2 grid:
+
+  Tile A | Tile B      Sprite 0: (X,   Y)   -> Tile A
+  -------+-------      Sprite 1: (X+8, Y)   -> Tile B
+  Tile C | Tile D      Sprite 2: (X,   Y+8) -> Tile C
+  -------+-------      Sprite 3: (X+8, Y+8) -> Tile D
+
+Each sub-sprite has its own tile index and position but shares the same
+palette. Offsets are stored in a data table (metasprite definition) and
+applied relative to a single anchor point:
+
+  MetaspritePlayer:
+      ;    Y-off, Tile, Attr, X-off
+      .byte $00,  $10,  $00,  $00   ; top-left
+      .byte $00,  $11,  $00,  $08   ; top-right
+      .byte $08,  $12,  $00,  $00   ; bottom-left
+      .byte $08,  $13,  $00,  $08   ; bottom-right
+      .byte $80                      ; end marker
+
+To move the character, you update the anchor position and loop through the
+table, writing each sub-sprite to the OAM buffer with the offsets applied.
+
+NES Sprite Limits:
+  - 64 hardware sprites total (a 16x16 character uses 4 of them)
+  - 8 sprites per scanline max (extras flicker/disappear)
+
+8x16 Sprite Mode (alternative):
+  Setting bit 5 of PPUCTRL enables 8x16 sprites. Each hardware sprite
+  becomes two tiles stacked vertically. A 16x16 character then needs only
+  2 hardware sprites instead of 4. Tradeoff: you lose the ability to use
+  8x8 sprites entirely — it's all-or-nothing.
+
+================================================================================
+
+NES CHR-ROM FORMAT
+------------------
+The NES stores tile graphics in CHR-ROM as a grid of 8x8 pixel tiles:
+
+  - 16 bytes per tile (8 bytes plane 0 + 8 bytes plane 1)
+  - 256 tiles per 4KB pattern table
+  - 512 tiles per 8KB CHR bank (two pattern tables)
+  - Tiles are arranged in a 16x16 grid (128x128 pixels) per pattern table
+
+A CHR-ready spritesheet PNG must be:
+  - Exactly 128 pixels wide
+  - 128 pixels tall (4KB, 256 tiles) or 256 pixels tall (8KB, 512 tiles)
+  - Max 4 colors per 8x8 tile
+
+================================================================================
+
+TOOL 1: png2chr.py
+------------------
+Converts a NES-ready PNG spritesheet into raw CHR-ROM binary.
+
+Location: tools/png2chr.py
+
+Usage:
+    python3 tools/png2chr.py input.png output.chr
+
+Input requirements:
+    - 128x128 (4KB) or 128x256 (8KB) PNG
+    - Max 4 colors per 8x8 tile
+
+How it works:
+    1. Reads the PNG pixel by pixel in 8x8 tile blocks
+    2. For each tile, sorts unique colors by brightness
+       (darkest = index 0 = transparent for sprites)
+    3. Encodes each pixel as a 2-bit index
+    4. Writes the NES planar format: 8 bytes plane 0 then 8 bytes plane 1
+    5. Outputs raw binary, ready for .incbin in assembly
+
+To use in assembly:
+    .segment "CHARS"
+    .incbin "sprites.chr"
+
+This replaces hundreds of hand-coded .byte lines.
+
+================================================================================
+
+TOOL 2: extract_sprites.py
+--------------------------
+Auto-detects and extracts sprites from an irregularly-laid-out spritesheet
+(like ripped game sprites or hand-drawn art with arbitrary spacing) and
+packs them onto a clean 128-pixel-wide NES-ready grid.
+
+Location: tools/extract_sprites.py
+
+Usage:
+    python3 tools/extract_sprites.py input.png output.png
+
+How it works:
+
+  Step 1 — Detect background color:
+    Samples all four edges of the image and picks the most common color.
+    All pixels matching this color (within a threshold) are treated as empty.
+
+  Step 2 — Find sprites (connected component analysis):
+    Uses BFS (breadth-first search) with 8-connectivity to find all groups
+    of connected non-background pixels. Each group becomes one sprite.
+    Regions smaller than 8x8 are filtered out as noise (thin lines, dots).
+    Sprites are sorted top-to-bottom, left-to-right for predictable ordering.
+
+  Step 3 — Build global 4-color palette:
+    Collects all non-background colors across all sprites, excluding colors
+    too similar to the background (distance threshold > 95).
+    Uses a two-pass approach:
+      - Separates colors into dark (brightness < 50, typically outlines)
+        and light (fills, highlights, skin tones)
+      - Picks the most common dark color as the outline color (index 1)
+      - Uses median cut to split remaining light colors into 2 groups
+    Final palette:
+      Index 0: background (transparent)
+      Index 1: dark outline color
+      Index 2: darker fill color
+      Index 3: lighter fill/highlight color
+
+  Step 4 — Quantize and pack:
+    Each sprite is padded to the next multiple of 8 in both dimensions
+    (aligning to tile boundaries). Sprites are packed left-to-right,
+    wrapping to a new row when the 128-pixel width is reached.
+    Every pixel is mapped to the nearest palette color.
+    Output height is clamped to 128 or 256 pixels.
+
+  Step 5 — Save:
+    Outputs a clean PNG ready for png2chr.py.
+
+================================================================================
+
+TOOL 3: convert.sh
+------------------
+Convenience wrapper for png2chr.py.
+
+Location: tools/convert.sh
+
+Usage:
+    ./tools/convert.sh filename.png
+
+Looks for the file in assets/raw/ and outputs to assets/chr/ with a .chr
+extension. Example:
+    ./tools/convert.sh megaman_tiles.png
+    # reads:  assets/raw/megaman_tiles.png
+    # writes: assets/chr/megaman_tiles.chr
+
+================================================================================
+
+PROJECT DIRECTORY STRUCTURE (NEW)
+---------------------------------
+  assets/
+    raw/          Source PNGs, Aseprite files, reference art
+    chr/          Converted NES CHR-ROM binaries (.chr files)
+  tools/
+    png2chr.py          PNG -> CHR binary converter
+    extract_sprites.py  Spritesheet auto-extractor and packer
+    convert.sh          Convenience wrapper for png2chr.py
+
+Both assets/ subdirectories have .gitkeep files to persist them in git
+while empty. These can be removed once real files are added.
+
+================================================================================
+
+MEDIAN CUT ALGORITHM
+---------------------
+Used for color reduction. Conceptually simple:
+
+  1. Put all colors in one "bucket"
+  2. Find the bucket with the widest range in any color channel (R, G, or B)
+  3. Sort that bucket by the widest channel and split it in half
+  4. Repeat until you have the desired number of buckets
+  5. Average each bucket (weighted by pixel count) to get representative colors
+
+This naturally preserves the most visually distinct colors. It's the same
+algorithm used by GIF and PNG quantizers.
+
+================================================================================
+
+PIPELINE EXAMPLE
+-----------------
+Full workflow for the Mega Man spritesheet:
+
+  1. Place source art:
+       assets/raw/8bitmegaman.png (322x405, full color, irregular layout)
+
+  2. Extract and pack sprites:
+       python3 tools/extract_sprites.py \
+           assets/raw/8bitmegaman.png \
+           assets/raw/megaman_tiles.png
+
+     Output: 128x256 PNG, 4 colors, 37 sprites packed (of 93 detected)
+     Palette: black (outline), medium blue (body), beige (skin/highlight)
+
+  3. Convert to CHR:
+       python3 tools/png2chr.py \
+           assets/raw/megaman_tiles.png \
+           assets/chr/megaman.chr
+
+     Output: 8KB CHR binary (512 tiles)
+
+  4. Use in assembly:
+       .segment "CHARS"
+       .incbin "megaman.chr"
+
+================================================================================
+
+LIMITATIONS AND KNOWN ISSUES
+------------------------------
+1. Sprite capacity: 93 sprites detected but only 37 fit in 128x256 (8KB).
+   The rest are silently dropped. For a full game, you'd need to either
+   select specific frames or use mapper hardware for CHR bank switching.
+
+2. Background color similarity: The spritesheet background (sky blue) is
+   very close to Mega Man's body blue. This makes automatic palette
+   detection tricky. A spritesheet with a magenta or black background
+   would produce better results.
+
+3. Single palette: All sprites share one 4-color palette. Real NES games
+   use multiple sprite palettes (the NES has 4 sprite palettes). For
+   example, Mega Man's face uses a different palette than his body.
+   Supporting per-sprite or per-tile palettes is a future enhancement.
+
+4. Color count: Mega Man has ~5 distinct colors (black, dark blue, cyan,
+   skin, white). Reducing to 3 non-background colors means some detail
+   is lost — the body blue and cyan merge into one shade.
+
+================================================================================
+
+DEPENDENCIES
+------------
+All Python tools require Pillow:
+    pip install Pillow
+
+================================================================================
+
+NEXT STEPS
+----------
+  - Implement a metasprite in assembly using the extracted tiles
+  - Add animation by swapping tile indices on a frame counter
+  - Consider 8x16 sprite mode for more efficient hardware sprite usage
+  - Add per-sprite palette support to the extraction tool
+  - Add a --max-sprites flag to control how many frames to extract
+  - Background scrolling for side-scrolling gameplay

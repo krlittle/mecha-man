@@ -1,0 +1,212 @@
+Session 01: Hello World NES ROM
+Date: 2026-01-29
+================================================================================
+
+GOAL
+----
+Set up the NES development toolchain and build a "Hello World" ROM from scratch
+to verify everything works before iterating toward an actual game.
+
+================================================================================
+
+STEP 1: INSTALL THE cc65 TOOLCHAIN
+-----------------------------------
+Installed via Homebrew:
+
+    brew install cc65
+
+This provides:
+  - ca65  — the 6502 assembler (converts .asm files into .o object files)
+  - ld65  — the linker (combines object files into a final ROM using a config)
+  - cc65  — a C compiler for the 6502 (not used in this project)
+
+Verified with:
+    ca65 --version   → V2.18
+    ld65 --version   → V2.18
+
+================================================================================
+
+STEP 2: NES ARCHITECTURE OVERVIEW
+-----------------------------------
+The NES has two separate buses:
+
+CPU Bus ($0000-$FFFF):
+  $0000-$07FF  — 2KB of RAM (variables, stack)
+  $2000-$2007  — PPU registers (how CPU talks to the graphics chip)
+  $4000-$4017  — APU & I/O registers (sound, controllers)
+  $8000-$FFFF  — Cartridge PRG-ROM (your code lives here)
+
+PPU Bus ($0000-$3FFF):
+  $0000-$1FFF  — CHR-ROM/RAM (pattern tables — tile graphics)
+  $2000-$23FF  — Nametable 0 (the "screen" — 32x30 grid of tile references)
+  $3F00-$3F1F  — Palette RAM (colors)
+
+KEY CONCEPT: The CPU cannot directly write to PPU memory. You write to PPU
+registers ($2000-$2007) to indirectly send data to the PPU bus.
+
+================================================================================
+
+STEP 3: PROJECT FILES CREATED
+-------------------------------
+
+3a. nes.cfg — Linker Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Tells ld65 how to organize code/data into the iNES ROM format.
+
+An NES ROM (iNES format) structure:
+  - 16-byte header (identifies it as an NES ROM)
+  - PRG-ROM banks (program code, mapped to CPU $8000-$FFFF)
+  - CHR-ROM banks (graphics data, mapped to PPU $0000-$1FFF)
+
+Our configuration (mapper 0 / NROM — the simplest):
+  - 1 x 16KB PRG-ROM bank (CPU $C000-$FFFF)
+  - 1 x 8KB CHR-ROM bank  (PPU $0000-$1FFF)
+
+MEMORY regions defined:
+  HEADER   — 16-byte iNES header
+  ZEROPAGE — $0000-$00FF (fast-access RAM, special 6502 instructions)
+  RAM      — $0200-$07FF (general purpose RAM)
+  OAM      — $0200-$02FF (sprite DMA buffer, reserved for future use)
+  PRG      — $C000-$FFFF (program code)
+  CHR      — $0000-$1FFF (graphics tiles)
+
+SEGMENTS map logical sections to memory regions:
+  HEADER, ZEROPAGE, BSS, OAM, CODE, RODATA, VECTORS, CHARS
+
+3b. hello.asm — Assembly Source Code
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+PPU Register Definitions:
+  PPUCTRL   = $2000  — PPU control (NMI enable, pattern table selection)
+  PPUMASK   = $2001  — PPU mask (enable/disable background & sprites)
+  PPUSTATUS = $2002  — PPU status (VBlank flag; reading resets address latch)
+  PPUADDR   = $2006  — PPU address (write high byte then low byte)
+  PPUDATA   = $2007  — PPU data (read/write PPU memory, auto-increments)
+
+iNES Header (16 bytes):
+  "NES" + $1A magic number
+  1 PRG-ROM bank (16KB), 1 CHR-ROM bank (8KB)
+  Mapper 0, horizontal mirroring, NTSC
+
+Reset Handler (entry point on power-on):
+  1. sei          — disable interrupts during init
+  2. cld          — clear decimal mode (NES 6502 doesn't have it, but good practice)
+  3. ldx #$FF / txs — set stack pointer to $01FF
+  4. Disable PPU rendering and NMIs
+  5. Wait for first VBlank (bit PPUSTATUS / bpl loop)
+  6. Clear all 2KB RAM ($0000-$07FF) to zero
+  7. Wait for second VBlank (PPU fully warmed up after ~30,000 cycles)
+
+Graphics Setup (PPU now ready):
+  1. Load palette: Write 32 bytes to PPU $3F00
+     - Read PPUSTATUS to reset latch
+     - Write $3F to PPUADDR (high byte)
+     - Write $00 to PPUADDR (low byte)
+     - Loop writing palette bytes via PPUDATA
+     - Palette: black background, white text color
+
+  2. Write text to nametable: "HELLO WORLD!" at row 14, col 10
+     - Nametable starts at PPU $2000, each row = 32 bytes
+     - Target address = $2000 + (14 * 32) + 10 = $21CA
+     - Write tile indices to PPUDATA (tiles defined in CHR-ROM)
+     - Tile mapping: $00=blank, $01-$1A = A-Z, $21 = '!'
+
+  3. Enable rendering:
+     - Reset scroll to (0,0) via PPUSCROLL ($2005)
+     - PPUCTRL = %10000000 (enable NMI, bg pattern table 0)
+     - PPUMASK = %00001010 (show background + leftmost 8px)
+
+  4. Loop forever (jmp Forever). NMI fires each frame but does nothing yet.
+
+NMI Handler: Just rti (return from interrupt). Placeholder for future game logic.
+IRQ Handler: Just rti. Unused.
+
+CHR-ROM (Tile Data):
+  - 8x8 pixel tiles, 16 bytes each (2 bit planes)
+  - Plane 0 (8 bytes): low bit of each pixel's 2-bit color
+  - Plane 1 (8 bytes): high bit of each pixel's 2-bit color
+  - Our font uses color 0 (transparent) and color 1 (white)
+  - Plane 1 always $00, Plane 0 holds the pixel pattern
+  - Tiles defined: blank ($00), A-Z ($01-$1A), ! ($21)
+
+Interrupt Vectors (at $FFFA-$FFFF):
+  $FFFA = NMI handler address
+  $FFFC = Reset handler address
+  $FFFE = IRQ handler address
+
+3c. Makefile — Build Automation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Build pipeline:
+  1. ca65 hello.asm → hello.o  (assemble)
+  2. ld65 -o hello.nes -C nes.cfg hello.o  (link)
+
+Commands:
+  make        — build the ROM
+  make clean  — remove .o and .nes files
+
+================================================================================
+
+STEP 4: BUILD AND VERIFY
+--------------------------
+Build command: make
+  ca65 -o hello.o hello.asm
+  ld65 -o hello.nes -C nes.cfg hello.o
+
+Output: hello.nes (24,592 bytes)
+  = 16 (header) + 16,384 (PRG-ROM) + 8,192 (CHR-ROM)
+
+Verified iNES header starts with "NES\x1A" — correct magic number.
+
+One harmless warning: "Segment 'OAM' does not exist" — we defined the memory
+region for future sprite use but haven't used it in code yet.
+
+================================================================================
+
+KEY 6502 INSTRUCTIONS INTRODUCED
+----------------------------------
+  sei          — Set interrupt disable flag
+  cld          — Clear decimal mode flag
+  lda #$XX     — Load accumulator with immediate value
+  ldx #$XX     — Load X register with immediate value
+  sta $XXXX    — Store accumulator to memory address
+  txs          — Transfer X to stack pointer
+  inx          — Increment X register
+  cpx #$XX     — Compare X to immediate value (sets flags)
+  cmp #$XX     — Compare accumulator to immediate value
+  bne label    — Branch if not equal (zero flag clear)
+  bpl label    — Branch if plus (negative flag clear)
+  beq label    — Branch if equal (zero flag set)
+  bit $XXXX    — Bit test (bit 7 → N flag, bit 6 → V flag)
+  jmp label    — Unconditional jump
+  rti          — Return from interrupt
+
+================================================================================
+
+EMULATOR RECOMMENDATIONS
+--------------------------
+  Mesen    — Best for development, has PPU viewer, memory viewer, disassembler
+  FCEUX    — Popular alternative with good debugging tools
+  Any NES emulator can open the .nes file to verify it works
+
+Expected result: "HELLO WORLD!" in white text on black background, centered.
+
+================================================================================
+
+EXECUTION FLOW SUMMARY
+------------------------
+  1. Power on → CPU reads reset vector at $FFFC → jumps to Reset
+  2. Reset → Disable interrupts, init stack, disable PPU
+  3. Wait for PPU warm-up (two VBlank periods)
+  4. Clear all RAM
+  5. Load color palette into PPU
+  6. Write "HELLO WORLD!" tile indices into nametable
+  7. Enable background rendering and NMI
+  8. Infinite loop; NMI fires each frame (~60Hz NTSC) as a no-op
+
+================================================================================
+
+NEXT STEPS
+-----------
+  - Verify ROM works in an emulator
+  - Begin iterating toward actual game features
+  - Potential next topics: sprites, controller input, scrolling, animation

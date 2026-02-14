@@ -1,0 +1,339 @@
+Session 02: Sprites & Controller Input
+Date: 2026-01-29
+================================================================================
+
+GOAL
+----
+Add a movable sprite to the Hello World ROM. The player uses the D-pad on
+controller 1 to move a character around the screen. This introduces two core
+NES concepts: reading the joypad and using OAM (Object Attribute Memory) for
+hardware sprites.
+
+================================================================================
+
+WHAT ARE NES SPRITES?
+---------------------
+The NES PPU supports 64 hardware sprites (also called "objects"). Each sprite
+is an 8x8 pixel tile that can be positioned anywhere on screen, independent
+of the background tile grid.
+
+Sprite data lives in OAM — a dedicated 256-byte block inside the PPU.
+Each sprite takes 4 bytes (64 sprites x 4 bytes = 256 bytes):
+
+  Byte 0: Y position  (top edge; displayed one scanline BELOW this value)
+  Byte 1: Tile index   (which 8x8 tile from the pattern table)
+  Byte 2: Attributes
+           Bits 0-1: Palette number (0-3, selects from sprite palettes)
+           Bit 5:    Priority (0 = in front of background, 1 = behind)
+           Bit 6:    Flip horizontally
+           Bit 7:    Flip vertically
+  Byte 3: X position  (left edge)
+
+KEY DIFFERENCE FROM BACKGROUND:
+  - Background tiles snap to an 8x8 grid (nametable).
+  - Sprites can be placed at any pixel position (smooth movement).
+
+================================================================================
+
+OAM DMA (FAST SPRITE TRANSFER)
+-------------------------------
+Writing 256 bytes to OAM one-at-a-time through OAMDATA ($2004) is slow and
+unreliable. Instead, the NES provides a DMA (Direct Memory Access) shortcut:
+
+  1. Keep a 256-byte "shadow OAM" buffer in CPU RAM at page $02 ($0200-$02FF)
+  2. During VBlank, write $00 to OAMADDR ($2003) to set OAM write start
+  3. Write $02 to OAMDMA ($4014) to trigger the transfer
+
+This copies all 256 bytes from $0200-$02FF to the PPU's OAM in ~514 CPU
+cycles. It MUST happen during VBlank (inside the NMI handler) to avoid
+visual glitches.
+
+New Registers Used:
+  OAMADDR = $2003  — Sets starting address within OAM for writes
+  OAMDATA = $2004  — Write sprite data byte-by-byte (rarely used directly)
+  OAMDMA  = $4014  — Write a page number to trigger 256-byte DMA transfer
+
+================================================================================
+
+HIDING UNUSED SPRITES
+---------------------
+The NES always renders all 64 sprites. Any sprite with random/zero data will
+appear as garbage on screen. To hide unused sprites, set their Y position to
+$FE (254), which places them below the visible screen area (0-239).
+
+Our init code hides sprites 1-63 (we only use sprite 0):
+
+    lda #$FE
+    ldx #$04            ; Start at sprite 1 (byte offset 4)
+  HideSprites:
+    sta $0200, x        ; Set Y to off-screen
+    inx
+    inx
+    inx
+    inx                 ; Skip to next sprite (every 4 bytes)
+    bne HideSprites     ; Loop until X wraps to 0
+
+================================================================================
+
+CONTROLLER INPUT
+----------------
+The NES controller has 8 buttons: A, B, Select, Start, Up, Down, Left, Right.
+
+Reading the controller is a 3-step process:
+
+  1. STROBE: Write 1 then 0 to JOYPAD1 ($4016).
+     This latches (snapshots) the current state of all buttons.
+
+       lda #$01
+       sta JOYPAD1     ; Strobe ON: start latching
+       lda #$00
+       sta JOYPAD1     ; Strobe OFF: buttons are now latched
+
+  2. READ: Read JOYPAD1 eight times. Each read returns one button's state
+     in bit 0. The buttons come out in this fixed order:
+
+       Read 1: A
+       Read 2: B
+       Read 3: Select
+       Read 4: Start
+       Read 5: Up
+       Read 6: Down
+       Read 7: Left
+       Read 8: Right
+
+  3. PACK INTO A BYTE: Use LSR + ROL to shift each button bit into a
+     single byte for easy testing later:
+
+       ldx #$08              ; 8 buttons to read
+     ReadController:
+       lda JOYPAD1           ; Read next button (bit 0 = pressed)
+       lsr a                 ; Shift bit 0 into Carry flag
+       rol controller        ; Rotate Carry into controller byte
+       dex
+       bne ReadController
+
+     Result in 'controller' variable:
+       Bit 7: A
+       Bit 6: B
+       Bit 5: Select
+       Bit 4: Start
+       Bit 3: Up
+       Bit 2: Down
+       Bit 1: Left
+       Bit 0: Right
+
+New Registers Used:
+  JOYPAD1 = $4016  — Controller 1 port (write to strobe, read for buttons)
+  JOYPAD2 = $4017  — Controller 2 port
+
+New 6502 Instructions:
+  lsr a    — Logical Shift Right on accumulator. Bit 0 goes into Carry flag.
+  rol addr — ROtate Left through carry. Shifts bits left, Carry goes into
+             bit 0, old bit 7 goes into Carry. Builds up a byte bit-by-bit.
+  dex      — DEcrement X register.
+
+================================================================================
+
+THE NMI HANDLER AS A GAME LOOP
+-------------------------------
+In session 01, the NMI handler was an empty stub (just "rti"). Now it becomes
+the heart of the program — a game loop that runs once per frame (~60Hz NTSC).
+
+NMI (Non-Maskable Interrupt) fires at the start of each VBlank period. This
+is the ONLY safe time to update PPU memory (OAM, nametable, palette, scroll).
+
+Our NMI handler does these steps every frame:
+
+  1. Save registers (pha, txa/pha, tya/pha)
+     — The NMI can interrupt the main loop at any point. We must preserve
+       the CPU state so the interrupted code can resume correctly.
+
+  2. OAM DMA — Copy sprite buffer to PPU (must happen during VBlank)
+
+  3. Read controller — Get current button states
+
+  4. Move sprite — Check D-pad bits, adjust sprite_x / sprite_y
+     - Movement speed: 2 pixels per frame (inc/dec twice)
+     - Boundary checks prevent going off-screen
+
+  5. Update OAM buffer — Write new X/Y to $0200/$0203
+
+  6. Reset scroll — OAM DMA corrupts the PPU address/scroll state.
+     We must reset it every frame:
+       bit PPUSTATUS     ; Reset latch
+       lda #$00
+       sta PPUSCROLL     ; X = 0
+       sta PPUSCROLL     ; Y = 0
+       lda #%10000000
+       sta PPUCTRL       ; Restore control register
+
+  7. Restore registers (pla/tay, pla/tax, pla) and rti
+
+IMPORTANT: Always save and restore A, X, Y in interrupt handlers. The main
+loop (or any interrupted code) expects these registers to be unchanged.
+
+================================================================================
+
+SPRITE PALETTES
+---------------
+The NES has 8 palettes total:
+  - 4 background palettes at PPU $3F00-$3F0F
+  - 4 sprite palettes at PPU $3F10-$3F1F
+
+Each palette has 4 colors, but color 0 is always transparent for sprites
+(shows the background behind the sprite).
+
+We updated sprite palette 0 ($3F10-$3F13) to:
+  $0F — Color 0: transparent (uses universal background color)
+  $21 — Color 1: light blue (sprite body)
+  $30 — Color 2: white (sprite highlights/eyes)
+  $16 — Color 3: red (accent, unused in current sprite)
+
+The sprite's attribute byte (byte 2 in OAM) selects which of the 4 sprite
+palettes to use. Our sprite uses palette 0 (attribute = $00).
+
+================================================================================
+
+2-BIT COLOR TILES (REVISITED FOR MULTI-COLOR)
+----------------------------------------------
+In session 01, our font tiles only used color 0 and color 1 (plane 1 was
+always $00). Our sprite tile uses TWO colors, requiring both bit planes:
+
+  Plane 0 (low bit)  + Plane 1 (high bit)  →  Color index
+       0                    0               →  0 (transparent)
+       1                    0               →  1 (light blue)
+       0                    1               →  2 (white)
+       1                    1               →  3 (red)
+
+For the sprite's "eye" row:
+  Plane 0: %01100110  — body pixels ON (color 1), eye pixels OFF
+  Plane 1: %00011000  — eye pixels ON (color 2), body pixels OFF
+
+  Combined per pixel:  01 01 10 10 01 01 00 00  (reading left to right)
+  That gives:          blue blue white white blue blue transparent transparent
+
+This is how the NES achieves multi-color tiles with just 16 bytes per tile.
+
+================================================================================
+
+PPUMASK CHANGES
+---------------
+Session 01:  %00001010  — Background only
+Session 02:  %00011110  — Background AND sprites
+
+  Bit 4 = 1: Show sprites
+  Bit 3 = 1: Show background
+  Bit 2 = 1: Show sprites in leftmost 8 pixels
+  Bit 1 = 1: Show background in leftmost 8 pixels
+
+Without bit 4, sprites are invisible even if OAM is set up correctly.
+
+================================================================================
+
+ZERO PAGE VARIABLES ADDED
+--------------------------
+The 6502's zero page ($0000-$00FF) allows shorter, faster instructions.
+Variables declared here:
+
+  sprite_x:   .res 1   — Sprite X position (0-255)
+  sprite_y:   .res 1   — Sprite Y position (0-239)
+  controller: .res 1   — Packed button state from controller read
+
+.res N reserves N bytes of uninitialized storage in the current segment.
+
+================================================================================
+
+BOUNDARY CLAMPING
+-----------------
+Without boundary checks, the sprite would wrap around the screen edges.
+We clamp movement with compare-and-branch:
+
+  ; Check UP
+  lda sprite_y
+  cmp #$02          ; At top edge?
+  bcc SkipUp        ; If Y < 2, don't move up (Carry Clear = less than)
+  dec sprite_y
+  dec sprite_y      ; Move 2 pixels up
+
+  ; Check DOWN
+  lda sprite_y
+  cmp #$DE          ; At bottom? ($DE = 222, leaving room for 8px sprite)
+  bcs SkipDown      ; If Y >= 222, don't move down (Carry Set = greater/equal)
+  inc sprite_y
+  inc sprite_y      ; Move 2 pixels down
+
+New concept: CMP sets the Carry flag for unsigned comparisons:
+  - Carry SET (bcs):   A >= operand
+  - Carry CLEAR (bcc): A < operand
+
+================================================================================
+
+NEW 6502 INSTRUCTIONS INTRODUCED
+----------------------------------
+  pha          — PusH Accumulator onto stack
+  pla          — PuLl (pop) Accumulator from stack
+  txa          — Transfer X to Accumulator
+  tya          — Transfer Y to Accumulator
+  tax          — Transfer Accumulator to X
+  tay          — Transfer Accumulator to Y
+  dex          — DEcrement X register
+  lsr a        — Logical Shift Right on accumulator (bit 0 → Carry)
+  rol addr     — ROtate Left through carry (Carry → bit 0, bit 7 → Carry)
+  and #$XX     — Bitwise AND accumulator with immediate value
+  bcc label    — Branch if Carry Clear (unsigned less-than after CMP)
+  bcs label    — Branch if Carry Set (unsigned greater-or-equal after CMP)
+  dec addr     — DECrement memory address
+  inc addr     — INCrement memory address
+
+================================================================================
+
+CHR-ROM TILE ADDED
+-------------------
+Tile $22: Player sprite — diamond shape with eyes
+
+  Plane 0:           Plane 1:           Visual:
+  ...**...           ........           ..BB....
+  ..****..           ........           .BBBB...
+  .******.           ........           BBBBBB..
+  .**..**.           ...**...           BB WW BB  (W = white eyes)
+  .******.           ........           BBBBBB..
+  .******.           ........           BBBBBB..
+  ..****..           ........           .BBBB...
+  ...**...           ........           ..BB....
+
+  B = color 1 (light blue), W = color 2 (white)
+
+================================================================================
+
+EXECUTION FLOW SUMMARY
+------------------------
+  Power on → Reset handler:
+    1. Init CPU (sei, cld, set stack pointer)
+    2. Disable PPU, wait for warm-up (two VBlanks)
+    3. Clear all RAM
+    4. Load palettes (background + sprite colors)
+    5. Write "HELLO WORLD!" to nametable
+    6. Set sprite initial position (center screen: 128, 119)
+    7. Set up OAM buffer at $0200 (Y, tile $22, attributes, X)
+    8. Hide unused sprites (Y = $FE for sprites 1-63)
+    9. Enable rendering (background + sprites)
+    10. Enter infinite loop
+
+  Every frame → NMI handler (~60Hz):
+    1. Save A/X/Y registers
+    2. OAM DMA: copy $0200-$02FF to PPU OAM
+    3. Strobe + read controller 1 (8 button bits)
+    4. Check D-pad, move sprite (2px/frame, clamped to screen)
+    5. Update OAM buffer with new position
+    6. Reset PPU scroll to (0,0)
+    7. Restore A/X/Y registers, rti
+
+================================================================================
+
+NEXT STEPS
+----------
+  - Animation: swap sprite tiles on a timer for walking/idle
+  - Multiple sprites: build a multi-tile character (16x16 or larger)
+  - Background scrolling: use PPUSCROLL for side-scrolling
+  - Collision detection: check sprite vs. background tiles
+  - Sound effects: use the APU pulse channels

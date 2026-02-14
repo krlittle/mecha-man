@@ -1,0 +1,261 @@
+Session 05: Gravity and Jumping
+Date: 2026-02-09
+================================================================================
+
+GOAL
+----
+Add velocity-based vertical movement with gravity and jumping to the player
+character. The player can press A to jump, rises into the air, and falls back
+down due to gravity.
+
+================================================================================
+
+PHYSICS MODEL
+-------------
+The NES runs at 60 Hz (NTSC). Each frame, we:
+
+  1. Check for jump input (A button) when on ground
+  2. Apply gravity to vertical velocity
+  3. Add velocity to Y position
+  4. Check for ground collision
+
+This creates smooth, natural-feeling jumps with an arc trajectory.
+
+================================================================================
+
+SIGNED ARITHMETIC ON THE 6502
+-----------------------------
+The 6502 uses two's complement for signed numbers:
+
+  Positive: $00-$7F (0 to 127)
+  Negative: $80-$FF (-128 to -1)
+
+Examples:
+  $F4 = -12 (jump velocity, upward)
+  $05 = +5  (gravity/falling)
+
+When we add a negative velocity to sprite_y, the position decreases (moves up).
+When velocity becomes positive (after gravity accumulates), position increases
+(moves down).
+
+The BMI (Branch if Minus) instruction checks bit 7 of the result, letting us
+detect negative values. BPL (Branch if Plus) checks for positive/zero.
+
+================================================================================
+
+ZERO PAGE VARIABLES ADDED
+-------------------------
+Two new variables in the ZEROPAGE segment:
+
+    vel_y:      .res 1   ; Vertical velocity (signed)
+    on_ground:  .res 1   ; 1 = on ground, 0 = in air
+
+vel_y is signed: negative values mean upward movement, positive means falling.
+on_ground prevents double-jumping and controls when gravity applies.
+
+================================================================================
+
+CONSTANTS ADDED
+---------------
+    GRAVITY         = 1      ; Added to vel_y each frame
+    JUMP_VELOCITY   = $F4    ; -12 in two's complement (upward)
+    GROUND_Y        = 200    ; Y position of the floor
+    TERMINAL_VEL    = 5      ; Maximum falling speed
+
+Tuning notes:
+  - Higher GRAVITY = faster falling, shorter jumps
+  - More negative JUMP_VELOCITY = higher jumps (e.g., $F0 = -16)
+  - TERMINAL_VEL prevents unrealistic acceleration during long falls
+  - GROUND_Y is a fixed floor; later sessions may add tile collision
+
+================================================================================
+
+HANDLEJUMP SUBROUTINE
+---------------------
+Initiates a jump when conditions are met:
+
+    HandleJump:
+        ; Check if on ground
+        lda on_ground
+        beq @Done               ; Not on ground, can't jump
+
+        ; Check if A button pressed (bit 7)
+        lda controller
+        bpl @Done               ; A not pressed (bit 7 = 0)
+
+        ; Start jump: set upward velocity, leave ground
+        lda #JUMP_VELOCITY
+        sta vel_y
+        lda #$00
+        sta on_ground
+
+    @Done:
+        rts
+
+Key points:
+  - Only allows jumping when on_ground = 1 (prevents double-jump)
+  - Uses BPL to check A button (bit 7): BPL branches if bit 7 is clear
+  - Sets negative velocity to move upward
+  - Clears on_ground immediately so gravity takes over
+
+================================================================================
+
+APPLYGRAVITY SUBROUTINE
+-----------------------
+Handles falling, velocity updates, and ground collision:
+
+    ApplyGravity:
+        ; If on ground, skip gravity
+        lda on_ground
+        bne @Done
+
+        ; Apply gravity: vel_y += GRAVITY
+        lda vel_y
+        clc
+        adc #GRAVITY
+        sta vel_y
+
+        ; Clamp to terminal velocity (only when falling)
+        bmi @ApplyVelocity      ; Still rising, don't clamp
+        cmp #TERMINAL_VEL
+        bcc @ApplyVelocity      ; Below terminal, ok
+        beq @ApplyVelocity      ; At terminal, ok
+        lda #TERMINAL_VEL       ; Clamp
+        sta vel_y
+
+    @ApplyVelocity:
+        ; Add vel_y to sprite_y
+        lda sprite_y
+        clc
+        adc vel_y
+        sta sprite_y
+
+        ; Check for ground collision
+        lda sprite_y
+        cmp #GROUND_Y
+        bcc @Done               ; Still in air
+
+        ; Land on ground
+        lda #GROUND_Y
+        sta sprite_y
+        lda #$00
+        sta vel_y
+        lda #$01
+        sta on_ground
+
+    @Done:
+        rts
+
+Key points:
+  - Skips entirely when on_ground = 1 (no gravity while standing)
+  - Gravity always pulls velocity toward positive (downward)
+  - Terminal velocity prevents infinite acceleration
+  - BMI detects rising (negative velocity) vs falling (positive)
+  - Ground collision snaps Y to floor and resets state
+
+================================================================================
+
+NMI HANDLER INTEGRATION
+-----------------------
+The new subroutines are called in the NMI handler after movement:
+
+    ; --- Step 4: Move player (left/right only) ---
+    jsr MovePlayer
+
+    ; --- Step 5: Handle jumping and gravity ---
+    jsr HandleJump
+    jsr ApplyGravity
+
+    ; --- Step 6: Update animation and draw metasprite ---
+    jsr UpdateAnimation
+
+Order matters:
+  1. MovePlayer handles horizontal input
+  2. HandleJump checks for jump initiation
+  3. ApplyGravity updates velocity and position
+  4. UpdateAnimation draws the result
+
+================================================================================
+
+INITIALIZATION
+--------------
+In the Reset handler, initialize the new variables:
+
+    lda #$00
+    sta vel_y            ; No vertical velocity
+    lda #$01
+    sta on_ground        ; Start on ground
+
+Starting on_ground = 1 ensures the player doesn't fall through the floor
+on the first frame.
+
+================================================================================
+
+JUMP ARC MATHEMATICS
+--------------------
+With GRAVITY=1 and JUMP_VELOCITY=-12:
+
+    Frame 0:  vel_y = -12, rising fast
+    Frame 1:  vel_y = -11
+    Frame 2:  vel_y = -10
+    ...
+    Frame 11: vel_y = -1, barely rising
+    Frame 12: vel_y = 0,  apex of jump
+    Frame 13: vel_y = +1, starting to fall
+    ...
+    Frame 17: vel_y = +5, terminal velocity (clamped)
+
+Total rise time: ~12 frames (0.2 seconds)
+Jump height: sum of velocities = 12+11+10+...+1 = 78 pixels
+
+The symmetric rise and fall (before terminal velocity) creates a natural
+parabolic arc.
+
+================================================================================
+
+POTENTIAL ISSUES AND SOLUTIONS
+------------------------------
+1. Falling through floor at high speeds:
+   - Current code checks if sprite_y >= GROUND_Y after adding velocity
+   - Works because terminal velocity (5) is small relative to collision check
+   - For faster speeds, would need to check BEFORE or interpolate
+
+2. Jump height feels wrong:
+   - Adjust JUMP_VELOCITY (more negative = higher)
+   - Adjust GRAVITY (higher = faster fall, lower arc)
+
+3. Floaty jumps:
+   - Increase GRAVITY for snappier response
+   - Consider variable gravity (more gravity when falling than rising)
+
+4. Can't jump while moving:
+   - Already works! MovePlayer and HandleJump are independent
+   - Horizontal and vertical movement are orthogonal
+
+================================================================================
+
+FILES MODIFIED
+--------------
+  hello.asm    Added physics constants, zero page vars, two subroutines,
+               updated NMI handler and Reset initialization
+
+================================================================================
+
+TESTING
+-------
+Load hello.nes in an NES emulator:
+  - Character should stand on ground at Y=200
+  - Press A: character jumps upward then falls back down
+  - Press left/right while jumping: can move horizontally in air
+  - Press A while in air: nothing happens (no double-jump)
+  - Release and re-press A after landing: can jump again
+
+================================================================================
+
+NEXT STEPS
+----------
+  - Jump animation (use different sprite when in air)
+  - Variable jump height (hold A longer = jump higher)
+  - Collision detection with background tiles (platforms)
+  - Coyote time (brief window to jump after walking off edge)
+  - Jump buffering (queue jump input just before landing)

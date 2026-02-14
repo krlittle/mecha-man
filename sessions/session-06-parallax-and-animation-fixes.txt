@@ -1,0 +1,204 @@
+Session 06: Parallax Scrolling & Animation Fixes
+Date: 2026-02-12
+================================================================================
+
+GOAL
+----
+Fix the running animation to use a full 6-frame cycle for smoother movement,
+add a simple parallax scrolling effect where the background moves at half the
+player's speed, and switch from the Mega Man character to a Mario sprite.
+
+================================================================================
+
+PARALLAX SCROLLING BASICS
+-------------------------
+Parallax creates an illusion of depth by moving background layers at different
+speeds than foreground objects. Closer objects appear to move faster, distant
+objects move slower.
+
+For a simple side-scrolling game, the most basic parallax is:
+
+    scroll_x = sprite_x / 2
+
+The background scrolls at half the player's speed. As the player moves right,
+the background scrolls right, but slower — creating the impression that the
+background is farther away than the player.
+
+================================================================================
+
+PPUSCROLL REGISTER
+------------------
+The NES PPU has a scroll register at $2005 that controls which part of the
+nametable(s) is visible on screen. You write to it twice:
+
+    lda scroll_x
+    sta PPUSCROLL     ; First write: X scroll (0-255)
+    lda #$00
+    sta PPUSCROLL     ; Second write: Y scroll (0-239)
+
+Important: The scroll must be set AFTER reading PPUSTATUS (to reset the
+write latch) and AFTER all other PPU writes. The standard pattern is:
+
+    bit PPUSTATUS     ; Reset PPU latch
+    lda scroll_x
+    sta PPUSCROLL
+    lda scroll_y
+    sta PPUSCROLL
+    lda #PPUCTRL_VAL
+    sta PPUCTRL       ; Must write PPUCTRL after scroll
+
+================================================================================
+
+IMPLEMENTATION
+--------------
+Added a zero page variable to track scroll position:
+
+    scroll_x:   .res 1   ; Background scroll X position (0-255)
+
+Added an UpdateCamera subroutine:
+
+    UpdateCamera:
+        lda sprite_x
+        lsr a              ; Divide by 2
+        sta scroll_x
+        rts
+
+Updated the NMI handler to call UpdateCamera and apply scroll:
+
+    jsr UpdateCamera
+
+    bit PPUSTATUS
+    lda scroll_x
+    sta PPUSCROLL          ; X scroll
+    lda #$00
+    sta PPUSCROLL          ; Y scroll (fixed at 0)
+    lda #PPUCTRL_VAL
+    sta PPUCTRL
+
+================================================================================
+
+6-FRAME RUN ANIMATION FIX
+-------------------------
+The original 3-frame run cycle looked choppy. A proper running animation
+typically needs at least 6 frames to show the full gait cycle:
+
+    Frame 0: Right leg forward
+    Frame 1: Legs passing
+    Frame 2: Left leg forward
+    Frame 3: Left leg back
+    Frame 4: Legs passing
+    Frame 5: Right leg back
+
+Added MetaRun4, MetaRun5, MetaRun6 metasprite definitions with tile indices
+continuing the pattern:
+
+    Pose    | Top-L | Top-R | Mid-L | Mid-R | Bot-L | Bot-R
+    --------|-------|-------|-------|-------|-------|------
+    Run 4   |  $08  |  $09  |  $18  |  $19  |  $28  |  $29
+    Run 5   |  $0A  |  $0B  |  $1A  |  $1B  |  $2A  |  $2B
+    Run 6   |  $0C  |  $0D  |  $1C  |  $1D  |  $2C  |  $2D
+
+Updated the frame count check in UpdateAnimation:
+
+    ; Wrap frame index (6 run frames: 0-5)
+    lda anim_frame
+    cmp #$06           ; Was: cmp #$03
+    bcc @ResolveFrame
+    lda #$00
+    sta anim_frame
+
+Extended the animation frame pointer tables:
+
+    RunFramesL:
+        .byte <MetaRun1, <MetaRun2, <MetaRun3, <MetaRun4, <MetaRun5, <MetaRun6
+    RunFramesH:
+        .byte >MetaRun1, >MetaRun2, >MetaRun3, >MetaRun4, >MetaRun5, >MetaRun6
+
+================================================================================
+
+MARIO SPRITE SWITCH
+-------------------
+Session also introduced switching to a Mario character sprite. This required:
+
+1. New asset pipeline tool: tools/extract_gif_frames.py
+   - Extracts frames from an animated GIF
+   - Converts to NES CHR format with proper tile layout
+
+2. New source assets:
+   - assets/raw/mario_running.gif (animated GIF source)
+   - assets/raw/mario_poses.png (extracted frame sheet)
+
+3. New CHR file:
+   - assets/chr/mario_sprites.chr
+
+4. Updated .incbin in hello.asm:
+   - Changed from: .incbin "assets/chr/megaman_sprites.chr"
+   - Changed to: .incbin "assets/chr/mario_sprites.chr"
+
+5. Simplified metasprite definitions:
+   - Mario is 16x16 (2x2 tiles) instead of Mega Man's 16x24 (2x3 tiles)
+   - Uses 4 hardware sprites per frame instead of 6
+   - Reduced tile indices to match smaller sprite layout
+
+================================================================================
+
+ROM VERSIONING INTRODUCED
+-------------------------
+To track progress across sessions, versioned ROM snapshots were added:
+
+    roms/
+      hello-v5-fix-run-animation.nes
+      hello-v6-parallax-background.nes
+      hello-v7-changed-to-mario-sprite.nes
+
+This allows comparing behavior between sessions without rebuilding old code.
+
+================================================================================
+
+NEW TOOLS ADDED
+---------------
+tools/extract_run_cycle.py
+    - Specialized tool for extracting running animation cycles
+    - Works with spritesheet images where run frames are in a row
+
+tools/extract_gif_frames.py
+    - Extracts frames from animated GIFs
+    - Useful for game sprites sourced from GIF animations
+    - Outputs frame sheet PNG ready for png2chr.py
+
+================================================================================
+
+FILES MODIFIED/CREATED
+----------------------
+  hello.asm                           MOD  Parallax scroll, 6-frame animation
+  assets/chr/megaman_sprites.chr      MOD  Updated CHR for 6 frames
+  assets/chr/mario_sprites.chr        NEW  Mario character CHR
+  assets/raw/megaman_poses.png        MOD  Added frames 4-6
+  assets/raw/megaman_running_spritesheet.png  NEW  Source for run cycle
+  assets/raw/mario_running.gif        NEW  Mario animation source
+  assets/raw/mario_poses.png          NEW  Mario extracted frames
+  tools/extract_run_cycle.py          NEW  Run cycle extractor
+  tools/extract_gif_frames.py         NEW  GIF frame extractor
+  roms/hello-v5-fix-run-animation.nes NEW  ROM snapshot
+  roms/hello-v6-parallax-background.nes NEW  ROM snapshot
+  roms/hello-v7-changed-to-mario-sprite.nes NEW  ROM snapshot
+
+================================================================================
+
+TESTING
+-------
+Load hello.nes in an NES emulator:
+  - Character displays with Mario sprite (16x16 pixels)
+  - Background scrolls right as player moves right
+  - Background moves at half player speed (parallax effect)
+  - Running animation is smooth 6-frame cycle
+  - Still has left/right movement and horizontal flip
+
+================================================================================
+
+NEXT STEPS
+----------
+  - True horizontal scrolling (2+ screen level)
+  - Metatile system for efficient level data
+  - Dynamic column updates as new screen content scrolls into view
+  - Collision with background tiles
