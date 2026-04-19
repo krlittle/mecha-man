@@ -147,6 +147,10 @@ current_screen:   .res 1  ; 0 or 1 (which screen we're on)
 fade_ready:       .res 1  ; Flag: pending palette color write to PPU
 fade_color:       .res 1  ; Sky color byte to write to $3F00
 
+; Metatile collision scratch
+mt_col:           .res 1  ; Column for GetMetatile lookup (0-31)
+mt_row:           .res 1  ; Row for GetMetatile lookup (0-14)
+
 ; ---------------------------------------------------------------------------
 ; BSS (Uninitialized RAM at $0300+)
 ; ---------------------------------------------------------------------------
@@ -509,43 +513,69 @@ HandleJump:
 
 
 ; --- ApplyGravity ---
-; Applies gravity to velocity, updates Y position, handles ground collision.
+; Applies gravity and velocity to sprite_y.
+; When on_ground, verifies the metatile below is still solid (walk-off detection).
+; When airborne, checks for metatile landing on any solid tile (ground or platform).
+; Pit death: if sprite_y exceeds screen bottom, respawn player.
 
 ApplyGravity:
-    ; If on ground and not jumping, skip gravity
     lda on_ground
-    bne @Done
+    beq @ApplyGrav          ; Already airborne: apply gravity
 
+    ; Verify still on solid ground (walk-off-edge detection)
+    jsr CalcMetatilePos
+    jsr GetMetatile
+    cmp #METATILE_SKY
+    bne @Done               ; Still solid, stay grounded
+    ; Tile gone — fell off edge, start falling
+    lda #$00
+    sta on_ground
+
+@ApplyGrav:
     ; Apply gravity: vel_y += GRAVITY
     lda vel_y
     clc
     adc #GRAVITY
     sta vel_y
 
-    ; Clamp to terminal velocity (only when falling, i.e., vel_y > 0)
-    ; Check if vel_y is positive and > TERMINAL_VEL
-    bmi @ApplyVelocity      ; Negative = still rising, don't clamp
+    ; Clamp to terminal velocity (positive = falling)
+    bmi @ApplyVelocity      ; Negative = rising, skip clamp
     cmp #TERMINAL_VEL
-    bcc @ApplyVelocity      ; Less than terminal, ok
-    beq @ApplyVelocity      ; Equal to terminal, ok
-    lda #TERMINAL_VEL       ; Clamp to terminal velocity
+    bcc @ApplyVelocity
+    beq @ApplyVelocity
+    lda #TERMINAL_VEL
     sta vel_y
 
 @ApplyVelocity:
-    ; Add vel_y to sprite_y (signed addition)
     lda sprite_y
     clc
     adc vel_y
-    sta sprite_y
+    sta sprite_y            ; A = new sprite_y
 
-    ; Check for ground collision
-    ; If sprite_y >= GROUND_Y, land
-    lda sprite_y
-    cmp #GROUND_Y
-    bcc @Done               ; sprite_y < GROUND_Y, still in air
+    ; Pit death: fell below the screen
+    cmp #220
+    bcc @CheckLand
+    jsr RespawnPlayer
+    jmp @Done
 
-    ; Land on ground
-    lda #GROUND_Y
+@CheckLand:
+    ; Only land on solid tiles when falling (vel_y >= 0)
+    lda vel_y
+    bmi @Done
+
+    jsr CalcMetatilePos
+    jsr GetMetatile
+    cmp #METATILE_SKY
+    beq @Done
+
+    ; Hit solid tile — snap to top of metatile row and land
+    lda mt_row
+    asl a
+    asl a
+    asl a
+    asl a               ; mt_row * 16 = pixel Y of tile top
+    sec
+    sbc #24             ; subtract sprite height offset (feet = sprite_y + 24)
     sta sprite_y
     lda #$00
     sta vel_y
@@ -975,6 +1005,143 @@ SwitchScreen:
     sta meta_ptr+1
     jsr DrawMetasprite
 
+    rts
+
+
+; --- CalcMetatilePos ---
+; Computes mt_col and mt_row from the player's current world position.
+;   mt_row = (sprite_y + 24) / 16        (feet are 24px below sprite top)
+;   mt_col = (player_world_x + 8) / 16   (center of 16px-wide player)
+; Clobbers: A, temp, temp2
+
+CalcMetatilePos:
+    ; mt_row = (sprite_y + 24) >> 4
+    lda sprite_y
+    clc
+    adc #24
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    cmp #15                 ; Clamp to valid row range 0-14
+    bcc @RowOK
+    lda #14
+@RowOK:
+    sta mt_row
+
+    ; mt_col = (player_world_x + 8) >> 4
+    ; Compute 16-bit add: center_lo = world_x_lo + 8 (carry into hi)
+    lda player_world_x_lo
+    clc
+    adc #8
+    sta temp                ; temp = center_lo
+    lda player_world_x_hi
+    adc #0                  ; propagate carry
+    ; A = center_hi (0 or 1 for a 2-screen level)
+    asl a
+    asl a
+    asl a
+    asl a                   ; center_hi * 16 → upper bits of mt_col
+    sta temp2
+    lda temp                ; center_lo
+    lsr a
+    lsr a
+    lsr a
+    lsr a                   ; center_lo >> 4 → lower bits of mt_col
+    ora temp2
+    sta mt_col
+    rts
+
+
+; --- GetMetatile ---
+; Returns the metatile type at (mt_col, mt_row) in A.
+; Clobbers: A, level_ptr, temp
+
+GetMetatile:
+    ; Compute offset = mt_col * 15 (using *16 - *1)
+    lda #$00
+    sta level_ptr+1
+    lda mt_col
+    asl a                   ; *2
+    asl a                   ; *4
+    asl a                   ; *8
+    asl a                   ; *16
+    sta level_ptr
+    bcc @NoCarry
+    inc level_ptr+1
+@NoCarry:
+    lda level_ptr
+    sec
+    sbc mt_col              ; *16 - mt_col = *15
+    sta level_ptr
+    lda level_ptr+1
+    sbc #$00
+    sta level_ptr+1
+
+    ; Add Level1Data base address
+    lda level_ptr
+    clc
+    adc #<Level1Data
+    sta level_ptr
+    lda level_ptr+1
+    adc #>Level1Data
+    sta level_ptr+1
+
+    ; Read metatile type at this row
+    ldy mt_row
+    lda (level_ptr), y
+    rts
+
+
+; --- RespawnPlayer ---
+; Resets the player to the left edge of the current screen after a pit death.
+
+RespawnPlayer:
+    lda #GROUND_Y
+    sta sprite_y
+    lda #$00
+    sta vel_y
+    lda #$01
+    sta on_ground
+    lda #$00
+    sta anim_state
+    sta anim_frame
+    sta anim_timer
+
+    ; World X and camera depend on which screen we're on
+    lda current_screen
+    beq @Screen0
+
+    ; Screen 1: world X = $0108, camera X = $0100
+    lda #$08
+    sta player_world_x_lo
+    lda #$01
+    sta player_world_x_hi
+    lda #$00
+    sta camera_x_lo
+    lda #$01
+    sta camera_x_hi
+    lda #$01
+    sta scroll_x_hi
+    lda #$20                ; Left col for camera at 256 is tile col 32
+    sta prev_scroll_col
+    jmp @CalcScreenX
+
+@Screen0:
+    lda #$08
+    sta player_world_x_lo
+    lda #$00
+    sta player_world_x_hi
+    sta camera_x_lo
+    sta camera_x_hi
+    sta scroll_x_hi
+    sta prev_scroll_col
+
+@CalcScreenX:
+    lda player_world_x_lo
+    sec
+    sbc camera_x_lo
+    sta sprite_x
     rts
 
 
