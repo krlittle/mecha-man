@@ -76,6 +76,10 @@ JUMP_VELOCITY   = $F4        ; -12 in two's complement (upward)
 GROUND_Y        = 184        ; Y position of the floor (row 13 metatile = tile row 26 = 208px, minus 24px sprite height)
 TERMINAL_VEL    = 5          ; Maximum falling speed
 
+; Screen transition / palette fade
+FADE_SPEED      = 10         ; Frames per fade step
+FADE_STEPS      = 4          ; Max fade step (0=full color, 4=black)
+
 ; ---------------------------------------------------------------------------
 ; iNES Header
 ; ---------------------------------------------------------------------------
@@ -134,6 +138,14 @@ scroll_x_hi:     .res 1   ; Nametable select bit (0 or 1)
 prev_scroll_col: .res 1   ; Last drawn column (for seam detection)
 col_to_draw:     .res 1   ; Next column to draw
 seam_ready:      .res 1   ; Flag: seam buffer ready to write
+
+; Screen transition state
+transition_state: .res 1  ; 0=play, 1=fade_out, 2=fade_in
+fade_timer:       .res 1  ; Frames until next fade step
+fade_step:        .res 1  ; Current fade level (0=full color, 4=black)
+current_screen:   .res 1  ; 0 or 1 (which screen we're on)
+fade_ready:       .res 1  ; Flag: pending palette color write to PPU
+fade_color:       .res 1  ; Sky color byte to write to $3F00
 
 ; ---------------------------------------------------------------------------
 ; BSS (Uninitialized RAM at $0300+)
@@ -239,6 +251,13 @@ LoadPalette:
     sta seam_ready       ; No seam to write yet
     sta prev_scroll_col  ; Leftmost column is 0 at camera_x=0
 
+    ; Transition/fade state
+    sta transition_state
+    sta fade_timer
+    sta fade_step
+    sta current_screen
+    sta fade_ready
+
     lda #$01
     sta on_ground        ; Start on ground
 
@@ -300,6 +319,14 @@ NMI:
     sta seam_ready
 @SkipSeam:
 
+    ; --- Step 2b: Write fade palette color if ready ---
+    lda fade_ready
+    beq @SkipFade
+    jsr WriteFadePalette
+    lda #$00
+    sta fade_ready
+@SkipFade:
+
     ; --- Step 3: Apply scroll to PPU (must be last PPU write) ---
     bit PPUSTATUS
     lda camera_x_lo
@@ -319,6 +346,13 @@ NMI:
     ; --- Step 4: Read controller ---
     jsr ReadControllerSub
 
+    ; --- Check transition state: skip gameplay while fading ---
+    lda transition_state
+    beq @GameplayActive
+    jsr UpdateTransition
+    jmp @GameDone
+
+@GameplayActive:
     ; --- Step 5: Update facing direction ---
     lda controller
     and #%00000001       ; Right
@@ -347,8 +381,13 @@ NMI:
     ; --- Step 9: Detect and prepare seam ---
     jsr PrepareSeam
 
-    ; --- Step 10: Update animation and draw metasprite ---
+    ; --- Step 10: Check for screen transition trigger ---
+    jsr CheckTransition
+
+    ; --- Step 11: Update animation and draw metasprite ---
     jsr UpdateAnimation
+
+@GameDone:
 
     pla
     tay
@@ -782,6 +821,163 @@ WriteSeam:
     rts
 
 
+; --- WriteFadePalette ---
+; Writes fade_color to PPU $3F00 (universal background / sky color).
+; Must be called during vblank.
+
+WriteFadePalette:
+    bit PPUSTATUS
+    lda #$3F
+    sta PPUADDR
+    lda #$00
+    sta PPUADDR
+    lda fade_color
+    sta PPUDATA
+    rts
+
+
+; --- CheckTransition ---
+; Triggers a fade-out when the player reaches the right world boundary.
+; Only triggers when not already transitioning.
+
+CheckTransition:
+    ; Already transitioning?
+    lda transition_state
+    bne @Done
+
+    ; Check if player is at the right world edge (16-bit compare)
+    lda player_world_x_hi
+    cmp #WORLD_RIGHT_HI
+    bcc @Done                ; High byte less = not there yet
+    lda player_world_x_lo
+    cmp #WORLD_RIGHT_LO
+    bcc @Done                ; Not at right edge yet
+
+    ; Start fade out
+    lda #$01
+    sta transition_state
+    lda #$00
+    sta fade_step
+    sta fade_timer
+
+@Done:
+    rts
+
+
+; --- UpdateTransition ---
+; Advances the fade timer and updates the sky palette color each step.
+; Handles fade-out (state 1) and fade-in (state 2).
+; Calls SwitchScreen when fully black.
+
+UpdateTransition:
+    ; Advance fade timer
+    inc fade_timer
+    lda fade_timer
+    cmp #FADE_SPEED
+    bcc @Done                ; Not yet time for next step
+
+    lda #$00
+    sta fade_timer
+
+    lda transition_state
+    cmp #$01
+    beq @FadeOut
+
+@FadeIn:
+    ; Decrement fade step toward 0 (full color)
+    lda fade_step
+    beq @FadeInDone
+    dec fade_step
+    jmp @PrepareWrite
+
+@FadeInDone:
+    ; Reached full color - transition complete
+    lda #$00
+    sta transition_state
+    jmp @Done                ; Color already written last step
+
+@FadeOut:
+    ; Increment fade step toward 4 (black)
+    inc fade_step
+    lda fade_step
+    cmp #FADE_STEPS + 1
+    bcc @PrepareWrite
+
+    ; Reached fully black - switch screen, begin fade-in
+    jsr SwitchScreen
+    lda #$02
+    sta transition_state
+    lda #FADE_STEPS
+    sta fade_step
+    ; Fall through to @PrepareWrite
+
+@PrepareWrite:
+    ; Look up sky color for current_screen at current fade_step
+    ldy fade_step
+    lda current_screen
+    beq @UseScreen1
+    lda Screen2_SkyFade, y
+    jmp @StoreColor
+@UseScreen1:
+    lda Screen1_SkyFade, y
+@StoreColor:
+    sta fade_color
+    lda #$01
+    sta fade_ready
+
+@Done:
+    rts
+
+
+; --- SwitchScreen ---
+; Toggles current_screen, resets player and camera to left side.
+; Called at the fully-black midpoint of a transition.
+
+SwitchScreen:
+    ; Toggle screen
+    lda current_screen
+    eor #$01
+    sta current_screen
+
+    ; Reset player world position to left edge
+    lda #$08
+    sta player_world_x_lo
+    lda #$00
+    sta player_world_x_hi
+
+    ; Reset camera to left edge
+    lda #$00
+    sta camera_x_lo
+    sta camera_x_hi
+    sta scroll_x_hi
+    sta prev_scroll_col
+
+    ; Reset sprite screen position
+    lda #$08
+    sta sprite_x
+
+    ; Reset player state
+    lda #GROUND_Y
+    sta sprite_y
+    lda #$00
+    sta vel_y
+    lda #$01
+    sta on_ground
+    lda #$00
+    sta anim_state
+    sta anim_frame
+    sta anim_timer
+
+    ; Draw standing pose into OAM buffer for fade-in
+    lda #<MetaStand
+    sta meta_ptr
+    lda #>MetaStand
+    sta meta_ptr+1
+    jsr DrawMetasprite
+
+    rts
+
+
 ; --- UpdateAnimation ---
 ; Determines current animation state (idle vs running), advances the
 ; animation timer, resolves the current frame, and calls DrawMetasprite.
@@ -1204,6 +1400,17 @@ RunFramesL:
     .byte <MetaRun1, <MetaRun2, <MetaRun3
 RunFramesH:
     .byte >MetaRun1, >MetaRun2, >MetaRun3
+
+; --- Sky fade color tables ---
+; Index = fade_step (0 = full color, 4 = black)
+; NES color format $XY: X = brightness (0-3), Y = hue
+; Screen 1: light blue sky ($21) fading to black
+Screen1_SkyFade:
+    .byte $21, $11, $01, $0F, $0F
+
+; Screen 2: warm tan sky ($28) fading to black
+Screen2_SkyFade:
+    .byte $28, $18, $08, $0F, $0F
 
 
 ; ---------------------------------------------------------------------------
