@@ -188,6 +188,9 @@ WaitVBlank2:
     bit PPUSTATUS
     bpl WaitVBlank2
 
+    ; Initialize APU for sound effects
+    jsr SoundInit
+
     ; ==================================================================
     ; PPU is ready. Set up graphics.
     ; ==================================================================
@@ -460,6 +463,7 @@ HandleJump:
     sta vel_y
     lda #$00
     sta on_ground
+    jsr SFX_Jump
 
 @Done:
     rts
@@ -508,6 +512,7 @@ ApplyGravity:
     sta vel_y
     lda #$01
     sta on_ground
+    jsr SFX_Land
 
 @Done:
     rts
@@ -824,9 +829,16 @@ UpdateAnimation:
     ; Wrap frame index (3 run frames: 0-2)
     lda anim_frame
     cmp #$03
-    bcc @ResolveFrame
+    bcc @StepSound
     lda #$00
     sta anim_frame
+
+@StepSound:
+    ; Only play step on even frames (frames 0 and 2) to avoid buzzing
+    lda anim_frame
+    lsr a
+    bcs @ResolveFrame
+    jsr SFX_Step
 
 @ResolveFrame:
     ; Look up the metasprite pointer for current state + frame
@@ -1091,6 +1103,13 @@ DrawLevel:
     lda #PPUCTRL_VAL
     sta PPUCTRL
     rts
+
+
+; ---------------------------------------------------------------------------
+; Sound Module
+; ---------------------------------------------------------------------------
+
+.include "sound.asm"
 
 
 ; ---------------------------------------------------------------------------
